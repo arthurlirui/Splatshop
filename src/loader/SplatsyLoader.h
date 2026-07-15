@@ -66,10 +66,22 @@ struct SplatsyLoader{
 	static void load(string path, Scene& scene, OrbitControls& controls){
 
 		auto headerSizeBuffer = readBinaryFile(path, 0, 4);
+		if(!headerSizeBuffer){
+			println("ERROR: failed to read header size from '{}'", path);
+			return;
+		}
 		int64_t headerSize = headerSizeBuffer->get<int32_t>(0);
 
 		int64_t filesize = fs::file_size(path);
+		if(headerSize <= 0 || headerSize > filesize){
+			println("ERROR: invalid header size {} in '{}'", headerSize, path);
+			return;
+		}
 		auto jsonBuffer = readBinaryFile(path, filesize - headerSize, headerSize);
+		if(!jsonBuffer){
+			println("ERROR: failed to read JSON header from '{}'", path);
+			return;
+		}
 		string strJson = string((const char*)(jsonBuffer->data), headerSize);
 
 		println("Loaded Json: '{}'", strJson);
@@ -86,24 +98,28 @@ struct SplatsyLoader{
 			}
 		}
 
-		for(json j_node : js["assets"]){
-			string type = j_node["type"];
+		if(js.contains("assets")){
+			for(json j_node : js["assets"]){
+				string type = j_node["type"];
 
-			if(type == "SNSplats"){
-				auto node = loadSNSplats(path, j_node, scene);
-				node->dmng.data.writeDepth = false;
-				node->hidden = true;
-				AssetLibrary::assets.push_back(node);
+				if(type == "SNSplats"){
+					auto node = loadSNSplats(path, j_node, scene);
+					node->dmng.data.writeDepth = false;
+					node->hidden = true;
+					AssetLibrary::assets.push_back(node);
+				}
 			}
 		}
 
-		json j_camera = js["camera"];
-		controls.yaw = j_camera["yaw"];
-		controls.pitch = j_camera["pitch"];
-		controls.radius = j_camera["radius"];
-		controls.target.x = j_camera["target"][0];
-		controls.target.y = j_camera["target"][1];
-		controls.target.z = j_camera["target"][2];
+		if(js.contains("camera")){
+			json j_camera = js["camera"];
+			controls.yaw = j_camera["yaw"];
+			controls.pitch = j_camera["pitch"];
+			controls.radius = j_camera["radius"];
+			controls.target.x = j_camera["target"][0];
+			controls.target.y = j_camera["target"][1];
+			controls.target.z = j_camera["target"][2];
+		}
 
 	
 	}

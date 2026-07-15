@@ -144,6 +144,12 @@ struct CudaModule{
 		string optInclude = std::format("-I {}", dir).c_str();
 		string cuda_include = std::format("-I {}/include", cuda_path);
 		string cudastd_include = std::format("-I {}/include/cuda/std", cuda_path);
+		// CUDA 13.x moved cuda/std (CCCL) headers under include/cccl/
+		string cccl_include = std::format("-I {}/include/cccl", cuda_path);
+		// In CUDA 13.x NVRTC no longer finds <cmath> etc. automatically.
+		// Point directly at the CCCL cuda/std directory so that standard headers
+		// like <cmath>, <type_traits> resolve to the CUDA-provided versions.
+		string cccl_cudastd_include = std::format("-I {}/include/cccl/cuda/std", cuda_path);
 
 
 		CUdevice device;
@@ -173,10 +179,14 @@ struct CudaModule{
 			"--extra-device-vectorization",
 			"-lineinfo",
 			cudastd_include.c_str(),
+			cccl_include.c_str(),
+			cccl_cudastd_include.c_str(),
 			cuda_include.c_str(),
 			optInclude.c_str(),
 			"-I ./",
 			"-I ./include",
+			// GCC predefined macros not available in NVRTC's EDG frontend
+			"-D__FLT_MAX__=3.402823466e+38f",
 			"--relocatable-device-code=true",
 			"-default-device",                   // assume __device__ if not specified
 			"--dlink-time-opt",                  // link time optimization "-dlto", 

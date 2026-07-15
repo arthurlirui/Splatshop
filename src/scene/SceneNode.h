@@ -72,6 +72,13 @@ struct SceneNode{
 		counter++;
 	}
 
+	// Virtual destructor is required so that derived class destructors
+	// (e.g. SNSplats::~SNSplats which frees GPU virtual memory) are invoked
+	// when a node is destroyed via a SceneNode* pointer or shared_ptr<SceneNode>.
+	virtual ~SceneNode(){
+		children.clear();
+	}
+
 	void traverse(function<void(SceneNode*)> callback){
 		callback(this);
 

@@ -21,7 +21,7 @@ void initCuda(){
 
 	CUcontext context;
 	cuDeviceGet(&CURuntime::device, 0);
-	cuCtxCreate(&context, 0, CURuntime::device);
+	cuCtxCreate(&context, NULL, 0, CURuntime::device);
 
 	// cuCtxSetLimit(CU_LIMIT_MALLOC_HEAP_SIZE, 10'000'000'000);
 
@@ -252,25 +252,29 @@ int main(){
 		string imgPath = "./resources/images/symbols.png";
 		uint8_t* data = stbi_load(imgPath.c_str(), &Runtime::gltex_symbols_width, &Runtime::gltex_symbols_height, &n, 4);
 
-		int numPixels = Runtime::gltex_symbols_width * Runtime::gltex_symbols_height;
-		for(int i = 0; i < numPixels; i++){
-			data[4 * i + 0] = 255 - data[4 * i + 0];
-			data[4 * i + 1] = 255 - data[4 * i + 1];
-			data[4 * i + 2] = 255 - data[4 * i + 2];
+		if(data == nullptr){
+			println("ERROR: failed to load texture '{}'", imgPath);
+		}else{
+			int numPixels = Runtime::gltex_symbols_width * Runtime::gltex_symbols_height;
+			for(int i = 0; i < numPixels; i++){
+				data[4 * i + 0] = 255 - data[4 * i + 0];
+				data[4 * i + 1] = 255 - data[4 * i + 1];
+				data[4 * i + 2] = 255 - data[4 * i + 2];
+			}
+
+			glGenTextures(1, &Runtime::gltex_symbols);
+			glBindTexture(GL_TEXTURE_2D, Runtime::gltex_symbols);
+
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, Runtime::gltex_symbols_width, Runtime::gltex_symbols_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+			glGenerateMipmap(GL_TEXTURE_2D);
+
+			stbi_image_free(data);
 		}
-
-		glGenTextures(1, &Runtime::gltex_symbols);
-		glBindTexture(GL_TEXTURE_2D, Runtime::gltex_symbols);
-
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, Runtime::gltex_symbols_width, Runtime::gltex_symbols_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-		glGenerateMipmap(GL_TEXTURE_2D);
-
-		stbi_image_free(data);
 	}
 
 	{ // load some textures
@@ -278,25 +282,29 @@ int main(){
 		string imgPath = "./resources/images/symbols_32x32.png";
 		uint8_t* data = stbi_load(imgPath.c_str(), &Runtime::gltex_symbols_32x32_width, &Runtime::gltex_symbols_32x32_height, &n, 4);
 
-		int numPixels = Runtime::gltex_symbols_32x32_width * Runtime::gltex_symbols_32x32_height;
-		for(int i = 0; i < numPixels; i++){
-			data[4 * i + 0] = data[4 * i + 0];
-			data[4 * i + 1] = data[4 * i + 1];
-			data[4 * i + 2] = data[4 * i + 2];
+		if(data == nullptr){
+			println("ERROR: failed to load texture '{}'", imgPath);
+		}else{
+			int numPixels = Runtime::gltex_symbols_32x32_width * Runtime::gltex_symbols_32x32_height;
+			for(int i = 0; i < numPixels; i++){
+				data[4 * i + 0] = data[4 * i + 0];
+				data[4 * i + 1] = data[4 * i + 1];
+				data[4 * i + 2] = data[4 * i + 2];
+			}
+
+			glGenTextures(1, &Runtime::gltex_symbols_32x32);
+			glBindTexture(GL_TEXTURE_2D, Runtime::gltex_symbols_32x32);
+
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, Runtime::gltex_symbols_32x32_width, Runtime::gltex_symbols_32x32_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+			glGenerateMipmap(GL_TEXTURE_2D);
+
+			stbi_image_free(data);
 		}
-
-		glGenTextures(1, &Runtime::gltex_symbols_32x32);
-		glBindTexture(GL_TEXTURE_2D, Runtime::gltex_symbols_32x32);
-
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, Runtime::gltex_symbols_32x32_width, Runtime::gltex_symbols_32x32_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-		glGenerateMipmap(GL_TEXTURE_2D);
-
-		stbi_image_free(data);
 	}
 
 	// GPUPrefixSums::init();

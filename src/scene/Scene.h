@@ -43,7 +43,7 @@ struct Scene {
 		SceneNode* found = nullptr;
 
 		root->traverse([&](SceneNode* node){
-			if(node->name == name){
+			if(!found && node->name == name){
 				found = node;
 			}
 		});
@@ -56,7 +56,7 @@ struct Scene {
 		SceneNode* found = nullptr;
 
 		root->traverse([&](SceneNode* node){
-			if(callback(node)){
+			if(!found && callback(node)){
 				found = node;
 			}
 		});
@@ -201,10 +201,6 @@ struct Scene {
 		};
 
 		traverse(nullptr, root.get());
-
-		double t_end = now();
-		double nanos = t_end - t_start;
-		double millies = nanos / 1'000'000.0;
 	}
 
 	void deselectAllNodes(){

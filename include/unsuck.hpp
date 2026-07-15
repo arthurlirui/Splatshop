@@ -423,12 +423,21 @@ inline string readTextFile(string path) {
 inline shared_ptr<Buffer> readBinaryFile(string path) {
 
 	auto file = fopen(path.c_str(), "rb");
+
+	if(!file){
+		println("ERROR: failed to open file '{}'", path);
+		return nullptr;
+	}
+
 	auto size = fs::file_size(path);
 
 	//vector<uint8_t> buffer(size);
 	auto buffer = make_shared<Buffer>(size);
 
-	fread(buffer->data, 1, size, file);
+	auto bytesRead = fread(buffer->data, 1, size, file);
+	if(bytesRead != size){
+		println("WARNING: read {} of {} bytes from '{}'", bytesRead, size, path);
+	}
 	fclose(file);
 
 	return buffer;
@@ -512,6 +521,11 @@ inline shared_ptr<Buffer> readBinaryFile(string path, uint64_t start, uint64_t s
 
 inline void readBinaryFile(string path, uint64_t start, uint64_t size, void* target) {
 	auto file = fopen(path.c_str(), "rb");
+
+	if(!file){
+		println("ERROR: failed to open file '{}' for reading", path);
+		return;
+	}
 
 	auto totalSize = fs::file_size(path);
 

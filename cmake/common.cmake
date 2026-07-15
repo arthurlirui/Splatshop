@@ -37,11 +37,19 @@ endfunction()
 if (WIN32)
 
 	function(ADD_CUDA TARGET_NAME)
+		# Prefer the system CUDA toolkit installation over conda/shadow copies.
+		set(CUDAToolkit_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2")
 		find_package(CUDAToolkit 12.4 REQUIRED)
-		target_include_directories(${TARGET_NAME} PRIVATE CUDAToolkit_INCLUDE_DIRS)
+		target_include_directories(${TARGET_NAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+		# Link against the raw import libraries from the system CUDA toolkit to ensure
+		# CUDA 13.x driver/NVRTC/nvJitLink APIs (cuCtxCreate_v4, nvrtcGetLTOIR, nvJitLink*)
+		# are resolved correctly and not confused by conda environment copies.
+		set(CUDA_LIB_DIR "${CUDAToolkit_ROOT}/lib/x64")
 		target_link_libraries(${TARGET_NAME}
-			CUDA::cuda_driver
-			CUDA::nvrtc)
+			${CUDA_LIB_DIR}/cuda.lib
+			${CUDA_LIB_DIR}/nvrtc.lib
+			${CUDA_LIB_DIR}/nvJitLink.lib
+		)
 	endfunction()
 
 elseif (UNIX)

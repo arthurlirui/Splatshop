@@ -46,6 +46,13 @@ struct ImguiNode : public SceneNode {
 
 	~ImguiNode(){
 		println("Destroying ImguiNode node {}", name);
+
+		// Free raw-pointer owned resources to prevent memory leaks.
+		delete page;
+		page = nullptr;
+
+		delete mesh;
+		mesh = nullptr;
 	}
 
 };

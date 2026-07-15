@@ -64,10 +64,33 @@ struct GSPlyLoader{
 		int64_t numSplats = 0;
 
 		auto potentialHeaderData = readBinaryFile(path, 0, 10'000);
+		if(!potentialHeaderData){
+			println("ERROR: failed to read PLY header from '{}'", path);
+			GSPlyHeader header;
+			header.numSplats = 0;
+			header.bytesPerSplat = 0;
+			header.headerSize = 0;
+			header.numSHCoefficients = 0;
+			header.shDegree = 0;
+			return header;
+		}
 		std::string strPotentialHeader(potentialHeaderData->data_char, potentialHeaderData->size);
 
 		uint64_t posStartEndHeader = strPotentialHeader.find("end_header");
+		if(posStartEndHeader == string::npos){
+			println("ERROR: 'end_header' not found in PLY file '{}'", path);
+			GSPlyHeader header;
+			header.numSplats = 0;
+			header.bytesPerSplat = 0;
+			header.headerSize = 0;
+			header.numSHCoefficients = 0;
+			header.shDegree = 0;
+			return header;
+		}
 		uint64_t posEndHeader = strPotentialHeader.find('\n', posStartEndHeader);
+		if(posEndHeader == string::npos){
+			posEndHeader = strPotentialHeader.size();
+		}
 		
 		auto headerData = readBinaryFile(path, 0, posEndHeader);
 		string strHeader(headerData->data_char, headerData->size);
@@ -267,12 +290,18 @@ struct GSPlyLoader{
 
 					float length = sqrt(x * x + y * y + z * z + w * w);
 
-					auto q = glm::quat(
-						w / length, 
-						x / length, 
-						y / length,
-						z / length 
-					);
+					// Guard against degenerate (all-zero) quaternions to avoid NaN.
+					glm::quat q;
+					if(length > 1e-20f){
+						q = glm::quat(
+							w / length, 
+							x / length, 
+							y / length,
+							z / length 
+						);
+					}else{
+						q = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+					}
 
 					splats->rotation->set(q.w, 16 * i +  0llu);
 					splats->rotation->set(q.x, 16 * i +  4llu);
@@ -331,7 +360,7 @@ struct GSPlyLoader{
 			double t_end = now();
 			double seconds = t_end - t_start;
 
-			println("loaded {:L} splats in {:.3f} seconds.", splats->numSplatsLoaded, seconds);
+			println("loaded {:L} splats in {:.3f} seconds.", splats->numSplatsLoaded.load(), seconds);
 		});
 
 		// t.join();

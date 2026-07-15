@@ -50,6 +50,13 @@ struct GLBLoader{
 
 		auto buffer = readBinaryFile(path);
 
+		if(!buffer){
+			println("ERROR: failed to load GLB file '{}'", path);
+			GLB empty;
+			empty.textureSize = {0, 0};
+			return empty;
+		}
+
 		uint32_t magic = buffer->get<uint32_t>(0);
 		uint32_t version = buffer->get<uint32_t>(4);
 		uint32_t length = buffer->get<uint32_t>(8);
@@ -155,7 +162,7 @@ struct GLBLoader{
 		glb.texture = texture;
 
 		
-		if(js["images"].size() > 0){
+		if(js.contains("images") && js["images"].size() > 0){
 			auto js_image = js["images"][0];
 			int bufferviewIndex = js_image["bufferView"];
 			int64_t byteOffset = binaryChunkOffset  + static_cast<int64_t>(js["bufferViews"][bufferviewIndex]["byteOffset"]);
@@ -166,12 +173,16 @@ struct GLBLoader{
 			int n;
 			uint8_t* data = stbi_load_from_memory(buffer->ptr + byteOffset, byteLength, &width, &height, &n, 4);
 
-			glb.textureSize = { width, height };
-			glb.texture = make_shared<Buffer>(width * height * 4);
+			if(data != nullptr){
+				glb.textureSize = { width, height };
+				glb.texture = make_shared<Buffer>(width * height * 4);
 
-			memcpy(glb.texture->data, data, width * height * 4);
+				memcpy(glb.texture->data, data, width * height * 4);
 
-			stbi_image_free(data);
+				stbi_image_free(data);
+			}else{
+				println("WARNING: stbi_load_from_memory failed for GLB image, using fallback texture");
+			}
 		}
 
 		return glb;
@@ -180,6 +191,11 @@ struct GLBLoader{
 	static void load(string path, function<void(GLB)> onMeshParsed){
 
 		auto buffer = readBinaryFile(path);
+
+		if(!buffer){
+			println("ERROR: failed to load GLB file '{}'", path);
+			return;
+		}
 
 		uint32_t magic = buffer->get<uint32_t>(0);
 		uint32_t version = buffer->get<uint32_t>(4);
@@ -289,21 +305,23 @@ struct GLBLoader{
 				glb.textureSize = {512, 512};
 				glb.texture = texture;
 
-				int materialIndex = glbPrimitive["material"];
-				auto material = js["materials"][materialIndex];
+				int imageIndex = -1;
+				if(glbPrimitive.contains("material") && js.contains("materials")){
+					int materialIndex = glbPrimitive["material"];
+					auto material = js["materials"][materialIndex];
 
-				int imageIndex = 0;
-				if(material.contains("pbrMetallicRoughness")){
-					auto whatever = material["pbrMetallicRoughness"];
-					if(whatever.contains("baseColorTexture")){
-						auto baseColorTexture = whatever["baseColorTexture"];
-						imageIndex = baseColorTexture["index"];
+					if(material.contains("pbrMetallicRoughness")){
+						auto whatever = material["pbrMetallicRoughness"];
+						if(whatever.contains("baseColorTexture")){
+							auto baseColorTexture = whatever["baseColorTexture"];
+							imageIndex = baseColorTexture["index"];
+						}
 					}
 				}
 
 
 				
-				// if(js["images"].size() > 0)
+				if(imageIndex >= 0 && js.contains("images") && imageIndex < static_cast<int>(js["images"].size()))
 				{
 					auto js_image = js["images"][imageIndex];
 					int bufferviewIndex = js_image["bufferView"];
@@ -315,12 +333,16 @@ struct GLBLoader{
 					int n;
 					uint8_t* data = stbi_load_from_memory(buffer->ptr + byteOffset, byteLength, &width, &height, &n, 4);
 
-					glb.textureSize = { width, height };
-					glb.texture = make_shared<Buffer>(width * height * 4);
+					if(data != nullptr){
+						glb.textureSize = { width, height };
+						glb.texture = make_shared<Buffer>(width * height * 4);
 
-					memcpy(glb.texture->data, data, width * height * 4);
+						memcpy(glb.texture->data, data, width * height * 4);
 
-					stbi_image_free(data);
+						stbi_image_free(data);
+					}else{
+						println("WARNING: stbi_load_from_memory failed for GLB image, using fallback texture");
+					}
 				}
 
 				onMeshParsed(glb);

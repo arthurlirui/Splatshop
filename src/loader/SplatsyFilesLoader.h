@@ -33,9 +33,6 @@ struct SplatsyFilesLoader{
 
 	static shared_ptr<SNSplats> loadSNSplats(string nodePath, Scene& scene){
 		
-		// string name = j_node["name"];
-		shared_ptr<Buffer> buffer = readBinaryFile(nodePath);
-
 		shared_ptr<Splats> splats = GSPlyLoader::load(nodePath);
 
 		mat4 transform = mat4(1.0f);
@@ -89,8 +86,14 @@ struct SplatsyFilesLoader{
 		// 	}
 		// }
 
-		vector<string> splatsfiles = listFiles(directory + "/splats");
-		vector<string> assetsfiles = listFiles(directory + "/assets");
+		vector<string> splatsfiles;
+		vector<string> assetsfiles;
+		if(fs::exists(directory + "/splats")){
+			splatsfiles = listFiles(directory + "/splats");
+		}
+		if(fs::exists(directory + "/assets")){
+			assetsfiles = listFiles(directory + "/assets");
+		}
 
 		for(string path : splatsfiles){
 			if(iEndsWith(path, ".ply")){
@@ -108,13 +111,15 @@ struct SplatsyFilesLoader{
 			}
 		}
 
-		json j_camera = js["camera"];
-		controls.yaw = j_camera["yaw"];
-		controls.pitch = j_camera["pitch"];
-		controls.radius = j_camera["radius"];
-		controls.target.x = j_camera["target"][0];
-		controls.target.y = j_camera["target"][1];
-		controls.target.z = j_camera["target"][2];
+		if(js.contains("camera")){
+			json j_camera = js["camera"];
+			controls.yaw = j_camera["yaw"];
+			controls.pitch = j_camera["pitch"];
+			controls.radius = j_camera["radius"];
+			controls.target.x = j_camera["target"][0];
+			controls.target.y = j_camera["target"][1];
+			controls.target.z = j_camera["target"][2];
+		}
 
 		int i = 0;
 		scene.process<SNSplats>([&](SNSplats* node){

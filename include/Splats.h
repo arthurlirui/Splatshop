@@ -7,6 +7,7 @@
 #include <format>
 #include <memory>
 #include <string>
+#include <atomic>
 
 #include "unsuck.hpp"
 
@@ -24,8 +25,8 @@ struct Splats {
 	int64_t numSHCoefficients;
 	int64_t shDegree;
 
-	// incremented concurrently - lets hope incrementing an int is atomic
-	int64_t numSplatsLoaded;
+	// incremented concurrently by loader threads; use atomic to avoid data races.
+	std::atomic<int64_t> numSplatsLoaded;
 
 	glm::mat4 world;
 
