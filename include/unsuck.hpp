@@ -3,6 +3,15 @@
 
 #define NOMINMAX
 
+#if defined(__linux__)
+	// glibc only declares fseeko64 when _LARGEFILE64_SOURCE is visible.
+	// Define it explicitly so the alias below compiles on strict toolchains
+	// (gcc-14 / README-mandated Ubuntu build) that don't enable it by default.
+	#ifndef _LARGEFILE64_SOURCE
+		#define _LARGEFILE64_SOURCE 1
+	#endif
+#endif
+
 #include <string>
 #include <vector>
 #include <fstream>
@@ -49,7 +58,7 @@ static double Infinity = std::numeric_limits<double>::infinity();
 
 #if defined(__linux__)
 constexpr auto fseek_64_all_platforms = fseeko64;
-#elif defined(WIN32)
+#elif defined(_WIN32)
 constexpr auto fseek_64_all_platforms = _fseeki64;
 #endif
 

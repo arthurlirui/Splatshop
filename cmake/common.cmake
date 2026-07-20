@@ -37,13 +37,20 @@ endfunction()
 if (WIN32)
 
 	function(ADD_CUDA TARGET_NAME)
-		# Prefer the system CUDA toolkit installation over conda/shadow copies.
-		set(CUDAToolkit_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2")
+		# Resolve the CUDA toolkit root in order of preference:
+		#   1. -DCUDAToolkit_ROOT=...        (explicit user override, CMake convention)
+		#   2. $ENV{CUDA_PATH}               (NVIDIA installer default; matches README Linux instructions)
+		#   3. find_package default search   (C:/Program Files/.../CUDA/vX.Y)
+		# Resolving the root explicitly lets us link the raw import libraries
+		# (cuda.lib / nvrtc.lib / nvJitLink.lib) from the system toolkit, avoiding
+		# conda/shadow copies that confuse cuCtxCreate_v4 / nvrtcGetLTOIR / nvJitLink*.
+		if(NOT CUDAToolkit_ROOT AND DEFINED ENV{CUDA_PATH})
+			set(CUDAToolkit_ROOT $ENV{CUDA_PATH})
+		endif()
+
 		find_package(CUDAToolkit 12.4 REQUIRED)
 		target_include_directories(${TARGET_NAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-		# Link against the raw import libraries from the system CUDA toolkit to ensure
-		# CUDA 13.x driver/NVRTC/nvJitLink APIs (cuCtxCreate_v4, nvrtcGetLTOIR, nvJitLink*)
-		# are resolved correctly and not confused by conda environment copies.
+
 		set(CUDA_LIB_DIR "${CUDAToolkit_ROOT}/lib/x64")
 		target_link_libraries(${TARGET_NAME}
 			${CUDA_LIB_DIR}/cuda.lib
@@ -55,14 +62,29 @@ if (WIN32)
 elseif (UNIX)
 
 	function(ADD_CUDA TARGET_NAME)
+		# Resolve the CUDA toolkit root in order of preference:
+		#   1. -DCUDAToolkit_ROOT=...        (explicit user override, CMake convention)
+		#   2. $ENV{CUDA_PATH}               (matches README Linux instructions)
+		#   3. find_package default search   (/usr/local/cuda, etc.)
+		if(NOT CUDAToolkit_ROOT AND DEFINED ENV{CUDA_PATH})
+			set(CUDAToolkit_ROOT $ENV{CUDA_PATH})
+		endif()
+
 		find_package(CUDAToolkit 12.4 REQUIRED)
-		target_include_directories(${TARGET_NAME} PRIVATE CUDAToolkit_INCLUDE_DIRS)
+		target_include_directories(${TARGET_NAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 		target_link_libraries(${TARGET_NAME}
 			CUDA::cuda_driver
 			CUDA::nvrtc
 			${CUDAToolkit_LIBRARIES}
 			${CUDAToolkit_CUDA_LIBRARY})
-		find_library(NVJITLINK_LIBRARY nvJitLink REQUIRED HINTS $ENV{CUDA_PATH}/lib64/stubs ${CUDAToolkit_LIBRARY_DIRS})
+
+		# libnvJitLink.so ships under lib64/stubs on Ubuntu; without the stubs path
+		# in the search hints, find_library fails (REQUIRED) when CUDA_PATH is unset.
+		find_library(NVJITLINK_LIBRARY nvJitLink REQUIRED
+			HINTS
+				${CUDAToolkit_ROOT}/lib64/stubs
+				$ENV{CUDA_PATH}/lib64/stubs
+				${CUDAToolkit_LIBRARY_DIRS})
 		if (NVJITLINK_LIBRARY)
 			target_link_libraries(${TARGET_NAME} ${NVJITLINK_LIBRARY})
 		endif()

@@ -143,13 +143,27 @@ struct CudaModule{
 
 		string optInclude = std::format("-I {}", dir).c_str();
 		string cuda_include = std::format("-I {}/include", cuda_path);
-		string cudastd_include = std::format("-I {}/include/cuda/std", cuda_path);
-		// CUDA 13.x moved cuda/std (CCCL) headers under include/cccl/
-		string cccl_include = std::format("-I {}/include/cccl", cuda_path);
-		// In CUDA 13.x NVRTC no longer finds <cmath> etc. automatically.
-		// Point directly at the CCCL cuda/std directory so that standard headers
-		// like <cmath>, <type_traits> resolve to the CUDA-provided versions.
-		string cccl_cudastd_include = std::format("-I {}/include/cccl/cuda/std", cuda_path);
+		// CUDA 13.x relocated the CCCL/cuda/std headers: the Windows installer moves
+		// them under include/cccl/cuda/std, while standard Linux installs keep the
+		// traditional include/cuda/std layout. Probe before adding each path so we
+		// only emit -I flags for directories that actually exist on this install
+		// (NVRTC tolerates non-existent -I paths but warns noisily).
+		string cudastd_include = "";
+		string cccl_include = "";
+		string cccl_cudastd_include = "";
+		if(fs::exists(fs::path(cuda_path) / "include" / "cuda" / "std")){
+			cudastd_include = std::format("-I {}/include/cuda/std", cuda_path);
+		}
+		if(fs::exists(fs::path(cuda_path) / "include" / "cccl")){
+			cccl_include = std::format("-I {}/include/cccl", cuda_path);
+			// In CUDA 13.x NVRTC no longer finds <cmath> etc. automatically on the
+			// cccl layout; point directly at the CCCL cuda/std directory so that
+			// standard headers like <cmath>, <type_traits> resolve to the CUDA
+			// provided versions.
+			if(fs::exists(fs::path(cuda_path) / "include" / "cccl" / "cuda" / "std")){
+				cccl_cudastd_include = std::format("-I {}/include/cccl/cuda/std", cuda_path);
+			}
+		}
 
 
 		CUdevice device;
@@ -171,16 +185,13 @@ struct CudaModule{
 		nvrtcCreateProgram(&prog, source.c_str(), name.c_str(), 0, NULL, NULL);
 
 
-		std::vector<const char*> opts = { 
+		std::vector<const char*> opts = {
 			// "--gpu-architecture=compute_75",
 			// "--gpu-architecture=compute_86",
 			arch.c_str(),
 			"--use_fast_math",
 			"--extra-device-vectorization",
 			"-lineinfo",
-			cudastd_include.c_str(),
-			cccl_include.c_str(),
-			cccl_cudastd_include.c_str(),
 			cuda_include.c_str(),
 			optInclude.c_str(),
 			"-I ./",
@@ -189,13 +200,18 @@ struct CudaModule{
 			"-D__FLT_MAX__=3.402823466e+38f",
 			"--relocatable-device-code=true",
 			"-default-device",                   // assume __device__ if not specified
-			"--dlink-time-opt",                  // link time optimization "-dlto", 
+			"--dlink-time-opt",                  // link time optimization "-dlto",
 			// "--dopt=on",
 			"--std=c++20",
 			"--disable-warnings",
 			"--split-compile=0",                 // compiler optimizations in parallel. 0 -> max available threads
 			"--time=cuda_compile_time.txt",      // show compiler timings
 		};
+		// cuda/std and CCCL include paths are layout-dependent; only add the ones
+		// that exist on the current toolkit install (see probe above).
+		if(!cudastd_include.empty()) opts.push_back(cudastd_include.c_str());
+		if(!cccl_include.empty()) opts.push_back(cccl_include.c_str());
+		if(!cccl_cudastd_include.empty()) opts.push_back(cccl_cudastd_include.c_str());
 
 		println("Compile Options: ");
 		for(auto opt : opts){
