@@ -130,6 +130,7 @@ Splatshop 是一个 C++/CUDA 的 3D 高斯泼溅（Gaussian Splatting）编辑�
 |---|---|---|
 | GET | `/` | API 元信息 |
 | GET | `/health` | ping C++ 桥接，返回 `{"bridge","fps","frame","width","height"}` |
+| GET | `/test` | 本地浏览器测试控制页（HTML，见[本地浏览器测试页](#本地浏览器测试页get-test)） |
 
 **`GET /health`** → `data`
 ```jsonc
@@ -349,6 +350,47 @@ curl -X POST http://localhost:8080/motion/node/5/animate \
   -H "Content-Type: application/json" \
   -d '{"target":{"translation":[10,0,0]},"duration_s":1.5,"ease":"out"}'
 ```
+
+---
+
+## 本地浏览器测试页（GET /test）
+
+服务内置一个自包含的测试控制页，用于在**本地浏览器**中验证鼠标/键盘/相机/刚体控制链路，无需任何 WebRTC 视频流。页面是纯 HTML/CSS/JS（无外部依赖），从同 origin 调用 API，因此没有 CORS 问题。
+
+### 启动
+
+```bash
+# 1. 启动 Splatshop（自动在 127.0.0.1:7654 启动 C++ 桥接）
+# 2. 启动 Python API（同机）
+conda activate splat-remote            # 或你的 venv
+uvicorn remote_api.server:app --host 0.0.0.0 --port 8080
+# 3. 浏览器打开
+http://localhost:8080/test
+```
+
+> 端口 8080 必须放行；若设置了 `SPLAT_API_TOKEN`，在页面顶部 Token 框填入即可（页面 fetch 自动带 `X-Splat-Token`）。
+
+### 页面功能
+
+| 区域 | 功能 | 调用端点 |
+|---|---|---|
+| 状态条 | 每 2s 检测桥接，红/绿指示灯 + FPS + 窗口尺寸 | `GET /health` |
+| 鼠标/相机拖拽 | 在画布区拖拽：左键=轨道旋转、右键=平移、滚轮=缩放。按下时先发一次 move 建基准避免首帧跳变，移动时节流 60Hz | `POST /mouse/event`、`/mouse/scroll` |
+| 相机姿态面板 | `yaw/pitch/radius/target` 输入 + 应用/读取 + 轨道微调按钮 + 缩放按钮 | `POST /camera/pose`、`GET /camera/pose`、`/camera/orbit`、`/camera/zoom` |
+| 键盘事件 | 页面任意处 `keydown/keyup` 边沿触发（去重防自动重复），失焦自动释放。另有「单次按键」输入框 | `POST /keyboard/key` |
+| 场景节点 | 「刷新节点」列表，点击选中；选中后填 translation/duration/ease 发动画 | `GET /scene/nodes`、`POST /motion/node/{id}/animate` |
+| 日志 | 实时显示请求与响应（含错误） | — |
+
+### 使用要点
+
+- **鼠标坐标映射**：画布坐标按比例缩放到 1920×1080 窗口像素（页面假设 Splatshop 窗口为该分辨率；若不同，拖拽仍有效但缩放比会偏）。
+- **键盘焦点**：按键需焦点在页面（非输入框）。在输入框内打字不会触发控制，避免误操作；空格/方向键已阻止浏览器默认行为。
+- **边沿触发**：键盘只发 press/release 各一次；鼠标按下建基准→移动发增量→松开发 release，符合 [WebRTC 集成指南](#webrtc-接收端集成指南) 的推荐时序。
+- **节点动画**：先点「刷新节点」选中目标，再填 translation 点「动画移动」；若节点不存在会返回 502 `node not found`（场景重载后 id 会变，需重新刷新）。
+
+### 不依赖视频流
+
+此页用于**验证控制链路**，不显示 Splatshop 画面。要边看画面边控制，请直接观察本机 Splatshop 窗口，或参照 [WebRTC 接收端集成指南](#webrtc-接收端集成指南) 接入视频流。
 
 ---
 
