@@ -94,3 +94,4 @@ splatmodels_benchmark_campus_close/
 splatmodels_benchmark_campus_far/
 splatmodels_statue_1/
 splatmodels_statue2/
+*.pyc
