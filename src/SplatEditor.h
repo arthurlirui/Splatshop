@@ -44,6 +44,11 @@
 #include "common.h"
 #include "utils.h"
 
+#include "motion/MotionTypes.h"
+#include "motion/MotionController.h"
+#include "motion/Timeline.h"
+#include "motion/RiggedHumanController.h"
+
 struct Action;
 struct InputAction;
 
@@ -112,6 +117,7 @@ struct SplatEditor{
 	CudaModularProgram* prog_triangles = nullptr;
 	CudaModularProgram* prog_lines = nullptr;
 	CudaModularProgram* prog_helpers = nullptr;
+	CudaModularProgram* prog_skinning = nullptr; // motion: per-frame LBS skinning + blendshape kernel
 
 	OpenVRHelper* ovr = nullptr;
 	View viewLeft;
@@ -175,6 +181,12 @@ struct SplatEditor{
 
 	AssetLibrary assetLibrary;
 
+	// Motion control module: keyframe timeline for rigid objects.
+	// (MotionController is a static-utility class; RiggedHumanController is
+	// added once skinned human nodes are introduced.)
+	motion::Timeline timeline;
+	motion::RiggedHumanController rigController;
+
 	// This is prepared at the start of the frame and provides most properties for CUDA kernels
 	CommonLaunchArgs launchArgs;
 
@@ -237,6 +249,7 @@ struct SplatEditor{
 		bool showGettingStarted = false;
 		bool showColorCorrection = false;
 		bool showToolbar = true;
+		bool showMotion = false;
 		bool openContextMenu = false;
 
 		bool showInset = false;
@@ -389,6 +402,7 @@ struct SplatEditor{
 	void makeColorCorrectionGui();
 	void makeSaveFileGUI();
 	void makeGettingStarted();
+	void makeMotionGUI();
 
 	// MISC
 	CudaGlMappings mapCudaGl(shared_ptr<GLTexture> source);

@@ -90,6 +90,12 @@ void SplatEditor::makeMenubar(){
 		}
 		endHighlightButtonIf();
 
+		startHighlightButtonIf(editor->settings.showMotion);
+		if(ImGui::Button("Motion")){
+			editor->settings.showMotion = !editor->settings.showMotion;
+		}
+		endHighlightButtonIf();
+
 		startHighlightButtonIf(editor->settings.showColorCorrection);
 		if(ImGui::Button("Color Correction")){
 			editor->settings.showColorCorrection = !editor->settings.showColorCorrection;

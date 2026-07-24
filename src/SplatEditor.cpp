@@ -1545,6 +1545,7 @@ void SplatEditor::initCudaProgram(){
 		{&prog_triangles,            "./src/render/triangles.cu"},
 		{&prog_lines,                "./src/render/lines.cu"},
 		{&prog_helpers,              "./src/render/helpers.cu"},
+		{&prog_skinning,             "./src/motion/skinning.cu"},
 		// {&prog_dbg,                  "./src/GPUSorting/RadixSort.cu"},
 	};
 
@@ -1723,6 +1724,7 @@ void SplatEditor::drawGUI() {
 		makeContextMenu();
 		makeSaveFileGUI();
 		makeGettingStarted();
+		makeMotionGUI();
 
 		// { // PROTOTYPING / DEBUG: Toggle between 3DGS and perspective correct scenes and rendering
 
@@ -2333,3 +2335,4 @@ int32_t SplatEditor::getNumDeletedSplats(){
 #include "gui/todos.inc"
 #include "gui/saveFile.h"
 #include "gui/gettingStarted.h"
+#include "gui/motion.h"

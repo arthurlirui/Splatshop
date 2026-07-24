@@ -1354,6 +1354,11 @@ void SplatEditor::draw(Scene* scene, vector<RenderTarget> targets){
 
 	cuCtxSynchronize();
 
+	// Motion control: deform rigged splat nodes (LBS + blendshapes) before any
+	// per-node staging launch, so the deformed position/scale/quaternion are
+	// ready in dmng.data for the render kernels. No-op for non-rigged scenes.
+	rigController.dispatchSkinning(*scene);
+
 	// Stuff that only needs to be done once for all targets
 	vector<SNPoints*> nodes;
 	scene->process<SNPoints>([&](SNPoints* node){

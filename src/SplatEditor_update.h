@@ -11,6 +11,23 @@ void SplatEditor::update(){
 
 	TWEEN::update();
 
+	// Motion control: advance the keyframe timeline. dt is measured from the
+	// previous frame; the timeline pushes sampled transforms into the scene
+	// graph via MotionController, which updateTransformations() propagates below.
+	{
+		static double lastMotionTime = now();
+		double curMotionTime = now();
+		double motionDt = curMotionTime - lastMotionTime;
+		lastMotionTime = curMotionTime;
+		timeline.update(scene, motionDt);
+	}
+
+	// Motion control: accumulate rigged-splat joint poses into skinning matrices
+	// and upload to device. The actual skinning kernel is dispatched in draw(),
+	// right before the per-node render launch, so deformed splats are ready for
+	// the staging kernel.
+	rigController.update(scene);
+
 	auto flip = glm::dmat4(
 		1.0, 0.0, 0.0, 0.0,
 		0.0, 0.0, 1.0, 0.0,

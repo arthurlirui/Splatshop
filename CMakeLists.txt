@@ -15,12 +15,13 @@ include(cmake/common.cmake)
 
 set(TARGET_NAME SplatEditor) 
 
-file(GLOB SplatEditor_SOURCES CONFIGURE_DEPENDS 
+file(GLOB SplatEditor_SOURCES CONFIGURE_DEPENDS
 	src/*.*
 	src/actions/*.*
 	src/GPUPrefixSums/*.*
 	src/GPUSorting/*.*
 	src/gui/*.*
+	src/motion/*.*
 	src/render/*.*
 	src/scene/*.*
 	src/update/*.*

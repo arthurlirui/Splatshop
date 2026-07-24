@@ -139,6 +139,27 @@ struct Scene {
 		}
 	}
 
+	// Replace `oldNode` with `newNode` in whichever parent's children list holds
+	// it, preserving the original child index. Returns true on success.
+	bool swapNode(shared_ptr<SceneNode> oldNode, shared_ptr<SceneNode> newNode){
+		deque<shared_ptr<SceneNode>> queue;
+		queue.push_back(root);
+		while(!queue.empty()){
+			auto parent = queue.front();
+			queue.pop_front();
+			for(size_t i = 0; i < parent->children.size(); i++){
+				if(parent->children[i] == oldNode){
+					// Inherit world placement so the new node appears where the old one was.
+					newNode->transform = oldNode->transform_global;
+					parent->children[i] = newNode;
+					return true;
+				}
+			}
+			for(auto child : parent->children) queue.push_back(child);
+		}
+		return false;
+	}
+
 	template<typename T>
 	void process(const function<void(T*)>& callback){
 		this->forEach<T>(callback);
