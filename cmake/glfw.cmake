@@ -13,4 +13,9 @@ FetchContent_Declare(
 		GIT_TAG             3.3.2
 )
 
+# GLFW 3.3.2 declares cmake_minimum_required(VERSION 2.x), which CMake 4.0+
+# no longer accepts. Allow the old policy version for the GLFW subproject only
+# (scope limited to this directory before FetchContent_MakeAvailable).
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
 FetchContent_MakeAvailable(glfw)
