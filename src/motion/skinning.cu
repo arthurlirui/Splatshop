@@ -25,8 +25,8 @@ using namespace std;
 #include "./libs/glm/glm/gtc/matrix_transform.hpp"
 #include "./libs/glm/glm/gtc/quaternion.hpp"
 
-#include "utils.cuh"
-#include "HostDeviceInterface.h"
+#include "../utils.cuh"
+#include "../HostDeviceInterface.h"
 
 namespace cg = cooperative_groups;
 

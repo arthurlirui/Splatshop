@@ -1,0 +1,25 @@
+# Conda environment for the Splatshop remote control API (Python frontend).
+#
+# Create:    conda env create -f environment.yml
+# Activate:  conda activate splat-remote
+# Update:    conda env update -f environment.yml --prune
+#
+# This only covers the Python HTTP server (remote_api/). The C++ Splatshop
+# binary is built separately via CMake and is independent of this environment.
+#
+# Run the server after activating:
+#     uvicorn remote_api.server:app --host 0.0.0.0 --port 8080
+
+name: splat-remote
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  # Web framework
+  - fastapi>=0.110
+  - pydantic>=2.6
+  - uvicorn>=0.27
+  # Standard server extras (uvloop/httpx for better perf on non-Windows)
+  - pip
+  - pip:
+      - "uvicorn[standard]>=0.27"

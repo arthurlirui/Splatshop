@@ -11,6 +11,7 @@
 #include "CURuntime.h"
 #include "ImageLoader.h"
 #include "SplatEditor.h"
+#include "remote/RemoteControlServer.h"
 
 using namespace std;
 
@@ -246,6 +247,11 @@ int main(){
 
 	SplatEditor::setup();
 	editor = SplatEditor::instance;
+
+	// Start the remote control bridge (out-of-process HTTP frontend connects
+	// via remote_api/ Python server -> 127.0.0.1:7654). All commands are
+	// marshalled onto this main thread through the EventQueue.
+	remote::RemoteControlServer::start(7654);
 
 	{ // load some textures
 		int n;

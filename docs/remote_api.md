@@ -1,0 +1,461 @@
+# Splatshop 远程控制 API
+
+一套基于 Python (FastAPI) 的 HTTP API，将 Splatshop 渲染窗口的鼠标、键盘、相机与刚体运动控制暴露给远程的 WebRTC 接收端，实现远程视角与相机运动。
+
+> 目录
+> - [概述](#概述)
+> - [架构与数据流](#架构与数据流)
+> - [启动顺序](#启动顺序)
+> - [协议约定](#协议约定)
+> - [认证](#认证)
+> - [错误处理](#错误处理)
+> - [API 端点参考](#api-端点参考)
+>   - [系统](#系统)
+>   - [相机](#相机)
+>   - [鼠标](#鼠标)
+>   - [键盘](#键盘)
+>   - [场景与刚体运动](#场景与刚体运动)
+> - [WebRTC 接收端集成指南](#webrtc-接收端集成指南)
+> - [环境变量配置](#环境变量配置)
+> - [故障排查](#故障排查)
+
+---
+
+## 概述
+
+Splatshop 是一个 C++/CUDA 的 3D 高斯泼溅（Gaussian Splatting）编辑器，渲染循环与 CUDA/GL 上下文绑定在主线程。本 API 在渲染进程之外运行一个 Python HTTP 服务，远程客户端（如浏览器中的 WebRTC 接收端）通过 HTTP 调用本 API；Python 服务再把命令通过本地 TCP 转发给 C++ 渲染进程，并在主线程上执行。
+
+```
+[WebRTC 接收端 / 浏览器] --HTTP--> [Python FastAPI :8080] --TCP JSON-RPC 127.0.0.1:7654--> [C++ SplatEditor 后台线程] --EventQueue--> [主线程渲染循环]
+```
+
+控制通道（本 API）与视频通道是分离的：
+- **视频流**由独立的采集/推流管线提供（例如 OBS、采集卡、或单独的 WebRTC 发送端把 Splatshop 窗口画面推送到浏览器）。
+- **本 API 仅负责输入回传**：浏览器在显示画面的同时，把用户的鼠标/键盘/相机操作通过 HTTP 发回，驱动远端 Splatshop 的视角。
+
+---
+
+## 架构与数据流
+
+```
+┌─────────────────────┐     HTTP/JSON      ┌──────────────────────┐    TCP 换行分隔 JSON    ┌──────────────────────────┐
+│  WebRTC 接收端       │ ─────────────────▶ │  Python FastAPI       │ ─────────────────────▶ │  C++ RemoteControlServer │
+│  (浏览器 JS / Python)│ ◀───────────────── │  remote_api/server.py │ ◀───────────────────── │  (后台 socket 线程)        │
+└─────────────────────┘    请求/响应        └──────────────────────┘     请求/响应            └────────────┬─────────────┘
+                                                                                                    │ schedule(lambda)
+                                                                                                    ▼
+                                                                                          ┌─────────────────────┐
+                                                                                          │  主线程 GLFW 渲染循环  │
+                                                                                          │  Runtime::controls   │
+                                                                                          │  Runtime::keyStates  │
+                                                                                          │  MotionController    │
+                                                                                          └─────────────────────┘
+```
+
+**为什么需要转发到主线程**：CUDA 上下文与 GL 上下文绑定在创建它们的线程（主线程）。代码库已内置线程安全的 `EventQueue` / `schedule()`（`include/unsuck.hpp`），每帧在 `GLRenderer::loop()` 中 `process()` 排空。C++ 桥接用 `std::promise<json>`/`future` 实现同步请求/响应：socket 线程把命令 `schedule` 到主线程，阻塞等待主线程执行完回填结果，再写回响应。
+
+**桥接协议**（换行分隔 JSON，UTF-8）：
+```jsonc
+// 请求
+{"id": 1, "cmd": "camera.orbit", "args": {"yaw": -1.3, "pitch": -0.3}}
+// 成功响应
+{"id": 1, "ok": true, "data": {"yaw": -1.3, "pitch": -0.3}}
+// 失败响应
+{"id": 1, "ok": false, "error": "node not found: 42"}
+```
+
+---
+
+## 启动顺序
+
+1. **编译并启动 Splatshop**：渲染窗口打开后，`main()` 会自动在 `127.0.0.1:7654` 启动 C++ 桥接（见 `src/main.cpp` 中 `remote::RemoteControlServer::start(7654)`）。控制台会打印 `RemoteControlServer: listening on 127.0.0.1:7654`。
+2. **安装并启动 Python 服务**：
+   ```bash
+   cd Splatshop
+   pip install -r remote_api/requirements.txt
+   uvicorn remote_api.server:app --host 0.0.0.0 --port 8080
+   # 或：python -m remote_api.server
+   ```
+3. **验证连通**：`curl http://<server>:8080/health` 应返回 `{"bridge":"up","fps":...,"frame":...,"width":...,"height":...}`。
+4. **WebRTC 接收端连接**：浏览器同时拉取视频流并调用本 API 回传输入（见 [WebRTC 接收端集成指南](#webrtc-接收端集成指南)）。
+
+---
+
+## 协议约定
+
+| 约定 | 说明 |
+|---|---|
+| **坐标系** | 3D 世界坐标 = Splatshop 内部坐标（右手系，Z 向上，见 `OrbitControls`）。 |
+| **鼠标坐标** | 窗口像素坐标，原点**左上**，Y 向下（浏览器/DOM 标准）。桥接层自动翻转为 app 内部坐标（`y' = height - y`）。 |
+| **角度** | 一律**弧度**。相机 `yaw` 绕 Z 轴，`pitch` 绕 X 轴。 |
+| **四元数** | 数组 `[x, y, z, w]`（与 motion Timeline JSON 一致，`src/motion/Timeline.cpp`）。 |
+| **向量** | 3 元素数组 `[x, y, z]`。 |
+| **鼠标按钮** | 字符串 `"left"` / `"right"` / `"middle"`。 |
+| **动作** | 字符串 `"press"` / `"release"` / `"repeat"`。 |
+| **键盘 key** | GLFW key 名（如 `"W"`、`"SPACE"`、`"LEFT_SHIFT"`，大小写不敏感），或直接传 GLFW 数值码。见 `remote_api/keymap.py` 与 C++ 端 `resolveKeyCode`。 |
+| **mods 位掩码** | shift=1, ctrl=2, alt=4, super=8（GLFW 约定）。 |
+| **响应体** | 成功 `200 {"ok":true,"data":{...}}`；失败见 [错误处理](#错误处理)。 |
+
+---
+
+## 认证
+
+默认无认证，仅适用于本地/可信网络。设置环境变量 `SPLAT_API_TOKEN=<secret>` 启用共享密钥：所有请求须带 `X-Splat-Token: <secret>` 头，否则返回 `401`。详见 [环境变量配置](#环境变量配置)。
+
+---
+
+## 错误处理
+
+| HTTP 状态 | 含义 | 触发条件 |
+|---|---|---|
+| `200` | 成功 | 正常返回 `{"ok":true,"data":...}` |
+| `400` | 请求体非法 | pydantic 校验失败（字段缺失/类型错误） |
+| `401` | 未认证 | token 不匹配 |
+| `404` | 资源不存在 | 路径错误（FastAPI 默认） |
+| `422` | 请求体可解析但校验失败 | pydantic 默认 |
+| `502` | 桥接返回错误 | C++ 桥接执行命令失败（如 node 不存在、未知命令）。`{"detail":"node not found: 42"}` |
+| `503` | 桥接不可达 | C++ 桥接未启动/连接失败。`{"detail":"cannot reach Splatshop bridge at 127.0.0.1:7654: ..."}` |
+
+桥接内部对每个命令有 10 秒主线程看门狗：若主线程超过 10s 未处理（例如渲染卡死），返回 `{"ok":false,"error":"main thread did not respond within 10s"}`，Python 端转成 `502`。
+
+---
+
+## API 端点参考
+
+所有端点路径见下表。`POST` 请求体为 JSON，响应为 `{"ok":true,"data":{...}}`（下文仅展示 `data` 内容以节省篇幅）。
+
+### 系统
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/` | API 元信息 |
+| GET | `/health` | ping C++ 桥接，返回 `{"bridge","fps","frame","width","height"}` |
+
+**`GET /health`** → `data`
+```jsonc
+{"bridge":"up","fps":60.0,"frame":12345,"width":1920,"height":1080}
+```
+```bash
+curl http://localhost:8080/health
+```
+
+---
+
+### 相机
+
+相机模型为轨道相机（`OrbitControls`）：`yaw`/`pitch` 围绕 `target` 旋转，`radius` 控制距离。
+
+| 方法 | 路径 | 请求体 | 说明 |
+|---|---|---|---|
+| POST | `/camera/orbit` | `{yaw?, pitch?, d_yaw?, d_pitch?}` | 绝对或增量设置旋转角（弧度） |
+| POST | `/camera/pan` | `{dx, dy}` | 相机本地坐标系平移 target |
+| POST | `/camera/zoom` | `{radius?}` 或 `{factor?}` | 绝对或乘性缩放 |
+| POST | `/camera/pose` | `{yaw?, pitch?, radius?, target?}` | 整体设置姿态 |
+| GET | `/camera/pose` | — | 读回当前姿态 + 位置 |
+| POST | `/camera/focus` | `{node_id?}` 或 `{min,max,factor?}` | 聚焦到节点包围盒或显式 AABB |
+
+**`POST /camera/orbit`** — 绝对设置或增量。绝对字段优先，`d_*` 累加。
+```jsonc
+// 请求
+{"yaw": -1.325, "pitch": -0.330}
+// 或增量
+{"d_yaw": 0.05, "d_pitch": -0.02}
+// data
+{"yaw": -1.325, "pitch": -0.330}
+```
+```bash
+curl -X POST http://localhost:8080/camera/orbit -H "Content-Type: application/json" -d '{"d_yaw":0.1}'
+```
+
+**`POST /camera/pan`** — 在相机本地坐标系平移 `target`（左/上为正），单位随 `radius` 缩放。
+```jsonc
+{"dx": -0.3, "dy": 0.2}
+// data
+{"target": [0.0, 0.0, 2.0]}
+```
+
+**`POST /camera/zoom`** — 二选一：`radius` 绝对值，或 `factor` 乘数（`factor<1` 拉近，`>1` 推远）。
+```jsonc
+{"factor": 0.9}
+// data
+{"radius": 4.22}
+```
+
+**`POST /camera/pose`** — 任意子集字段均可（缺省字段不变）。
+```jsonc
+{"yaw":-1.325,"pitch":-0.330,"radius":4.691,"target":[-0.028,-0.100,2.301]}
+// data
+{"yaw":-1.325,"pitch":-0.330,"radius":4.691,"target":[-0.028,-0.100,2.301]}
+```
+
+**`GET /camera/pose`** — 供 WebRTC 接收端同步视角。
+```jsonc
+{"yaw":-1.325,"pitch":-0.330,"radius":4.691,
+ "target":[-0.028,-0.100,2.301],
+ "position":[-3.879,12.585,-8.257]}
+```
+```bash
+curl http://localhost:8080/camera/pose
+```
+
+**`POST /camera/focus`** — 聚焦到某节点（用 `/scene/nodes` 查 `node_id`）或显式 AABB。
+```jsonc
+{"node_id": 5, "factor": 1.2}
+// 或
+{"min":[-1,-1,-1],"max":[1,1,1],"factor":1.0}
+// data
+{"target":[0.0,0.0,0.0],"radius":3.46}
+```
+
+---
+
+### 鼠标
+
+注入鼠标事件，驱动 `Runtime::controls` 与 `Runtime::mouseEvents`。坐标原点左上、Y 向下，桥接自动翻转。
+
+| 方法 | 路径 | 请求体 | 说明 |
+|---|---|---|---|
+| POST | `/mouse/move` | `{x, y}` | 移动光标到 (x,y) 并喂给轨道相机 |
+| POST | `/mouse/button` | `{button, action, mods?}` | 按下/释放按钮 |
+| POST | `/mouse/scroll` | `{dx, dy}` | 滚轮（`dy>0` 拉近） |
+| POST | `/mouse/event` | `{x?, y?, button?, action?, mods?, scroll_dx?, scroll_dy?}` | 复合事件，一次往返完成多步 |
+
+**`POST /mouse/move`**
+```jsonc
+{"x": 960, "y": 540}
+// data
+{"x": 960, "y": 540}
+```
+
+**`POST /mouse/button`**
+```jsonc
+{"button":"left","action":"press","mods":0}
+// data
+{"button":0,"action":1,"mouseButtons":1}
+```
+
+**`POST /mouse/scroll`**
+```jsonc
+{"dx":0.0,"dy":1.0}
+// data
+{"dx":0.0,"dy":1.0,"radius":4.26}
+```
+
+**`POST /mouse/event`** — 高频拖拽推荐：一次往返里既移动又按下/释放，减少 RTT。
+```jsonc
+{"x":200,"y":300,"button":"left","action":"press"}
+```
+
+> 轨道相机依赖 `mousePos` 差分：首次 `/mouse/move` 应先发一次当前坐标建立基准，再发增量移动，避免首帧跳变。
+
+---
+
+### 键盘
+
+注入键盘事件到 `Runtime::keyStates` 与 `Runtime::frame_keys/...`，使编辑器的快捷键系统（`Runtime::getKeyAction`）正常工作。
+
+| 方法 | 路径 | 请求体 | 说明 |
+|---|---|---|---|
+| POST | `/keyboard/key` | `{key, action, mods?}` | 单个按键事件 |
+| POST | `/keyboard/press` | `{key, duration_ms?, mods?}` | 便捷：按下→等待→释放 |
+| POST | `/keyboard/sequence` | `{text}` | 逐字符 press/release（仅可打印字符） |
+
+**`POST /keyboard/key`**
+```jsonc
+{"key":"W","action":"press","mods":0}
+// data
+{"key":87,"action":1}
+```
+```bash
+curl -X POST http://localhost:8080/keyboard/key -H "Content-Type: application/json" -d '{"key":"SPACE","action":"press"}'
+```
+
+**`POST /keyboard/press`** — 适合触发一次快捷键。
+```jsonc
+{"key":"t","duration_ms":50}
+```
+
+**`POST /keyboard/sequence`** — 逐字符打入。
+```jsonc
+{"text":"hello"}
+// data
+{"results":[{"char":"h","ok":true},...]}
+```
+
+> 键名表见 `remote_api/keymap.py`（与 C++ `resolveKeyCode` 一致）。单字符 A–Z / 0–9 直接传字符；功能键用名称如 `"ENTER"`、`"ESC"`/`"ESCAPE"`、`"F1"`、`"LEFT_SHIFT"`、`"KP_0"`。
+
+---
+
+### 场景与刚体运动
+
+刚体运动基于 `motion::MotionController`（`src/motion/MotionController.h`），目标是节点的局部 transform，下一帧由 `Scene::updateTransformations()` 传播。节点按 `SceneNode::ID`（int64）寻址，先用 `/scene/nodes` 查 id。
+
+| 方法 | 路径 | 请求体 | 说明 |
+|---|---|---|---|
+| GET | `/scene/nodes` | — | 枚举场景树 `[{id,name,type}]` |
+| GET | `/motion/node/{id}/transform` | — | 读 transform |
+| POST | `/motion/node/{id}/transform` | `Transform{translation?, rotation?, scale?}` | 整体设置 |
+| POST | `/motion/node/{id}/translate` | `{delta:[x,y,z]}` | 相对平移 |
+| POST | `/motion/node/{id}/rotate` | `{delta:[x,y,z,w]}` | 本地原点预乘旋转 |
+| POST | `/motion/node/{id}/scale` | `{factor:[x,y,z]}` | 乘性缩放 |
+| POST | `/motion/node/{id}/animate` | `{target:Transform, duration_s?, ease?}` | 平滑过渡（TWEEN 驱动，非阻塞） |
+
+**`GET /scene/nodes`**
+```jsonc
+{"nodes":[{"id":0,"name":"root","type":"SceneNode"},
+          {"id":1,"name":"world","type":"SceneNode"},
+          {"id":5,"name":"garden","type":"SNSplats"}]}
+```
+
+**`GET /motion/node/5/transform`**
+```jsonc
+{"translation":[0.0,0.0,0.0],
+ "rotation":[0.0,0.0,0.0,1.0],
+ "scale":[1.0,1.0,1.0]}
+```
+
+**`POST /motion/node/5/transform`** — 缺省字段保留原值。
+```jsonc
+{"translation":[10.0,0.0,0.0],"rotation":[0.0,1.0,0.0,0.0],"scale":[1.0,1.0,1.0]}
+```
+
+**`POST /motion/node/5/translate`**
+```jsonc
+{"delta":[1.0,2.0,3.0]}
+```
+
+**`POST /motion/node/5/rotate`** — 四元数 `[x,y,z,w]`，本地原点预乘。
+```jsonc
+{"delta":[0.0,1.0,0.0,0.0]}
+```
+
+**`POST /motion/node/5/scale`**
+```jsonc
+{"factor":[2.0,2.0,2.0]}
+```
+
+**`POST /motion/node/5/animate`** — 异步过渡，立即返回；过渡由 TWEEN 系统在主线程逐帧推进，无需客户端持续调用。
+```jsonc
+{"target":{"translation":[10,0,0],"rotation":[0,0,0,1],"scale":[1,1,1]},
+ "duration_s":2.0,
+ "ease":"in_out"}
+// data
+{"duration_s":2.0,"ease":"in_out"}
+```
+`ease` 取值：`"linear"` / `"in"` / `"out"` / `"in_out"`（默认 `in_out`）。
+
+```bash
+curl -X POST http://localhost:8080/motion/node/5/animate \
+  -H "Content-Type: application/json" \
+  -d '{"target":{"translation":[10,0,0]},"duration_s":1.5,"ease":"out"}'
+```
+
+---
+
+## WebRTC 接收端集成指南
+
+本 API 只负责输入控制，不提供视频流。WebRTC 接收端需自行获取视频流（窗口采集 + WebRTC 推送），并在显示画面的同时把用户输入回传到本 API。
+
+### 拓扑
+
+```
+[Splatshop 窗口] --采集(OBS/采集卡/WebRTC sender)--> [WebRTC] --> [浏览器接收端]
+                                                                        │  用户输入(鼠标/键盘/手势)
+                                                                        ▼ HTTP
+                                                              [Python FastAPI :8080]
+                                                                        │
+                                                                        ▼
+                                                              [Splatshop 桥接/主线程]
+```
+
+### 推荐调用时序
+
+| 输入类型 | 端点 | 频率/策略 |
+|---|---|---|
+| 相机姿态同步（一次性/低频） | `GET /camera/pose` | 连接时拉一次建立基准；切换场景后重拉 |
+| 相机绝对定位（用户切换预设视角） | `POST /camera/pose` | 按需（事件触发） |
+| 轨道旋转（拖拽） | `POST /mouse/event` 复合：press→move…→release | 节流 30–60Hz，客户端做惯性平滑 |
+| 平移（右键拖拽） | `/mouse/event` 配合 `button:"right"` | 同上 |
+| 缩放（滚轮/捏合） | `/mouse/scroll` | 边沿触发，按事件发送 |
+| 单次快捷键 | `/keyboard/press` | 边沿触发，press+release 各一次 |
+| 持续移动键（WASD） | `/keyboard/key` press / release | 仅在按下与松开时各发一次（边沿触发，**不要**轮询） |
+
+### 性能与平滑建议
+
+1. **节流高频输入**：浏览器 `mousemove` 可达 200+Hz。用一个 ~16ms（60Hz）的节流/合并循环，把累积的最后一次坐标用 `/mouse/event` 发出，避免淹没桥接。
+2. **客户端预测**：视频流有 50–200ms 端到端延迟。为减少拖拽"滞后感"，可在客户端用最近一次 `GET /camera/pose` + 本地增量先做预测，待视频帧到达再校正；低频（如 2Hz）用 `GET /camera/pose` 校正漂移。
+3. **边沿触发优先**：按键与按钮只在状态变化时发送（press/release），不要按帧轮询，否则会重复触发编辑器快捷键。
+4. **连接复用**：浏览器侧用 `fetch` + `keepalive` 或 HTTP/2 连接复用，减少握手开销。Python 端对每个 HTTP 请求开一条到 C++ 的新 TCP 短连接（C++ 端每连接一个线程，开销低）。
+5. **退避**：若 `/health` 返回 503 或超时，以指数退避重连，避免在桥接未就绪时刷请求。
+
+### 浏览器侧调用示例（fetch）
+
+```js
+const API = "http://splatshop-host:8080";
+
+async function orbit(dyaw, dpitch) {
+  await fetch(`${API}/camera/orbit`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({d_yaw: dyaw, d_pitch: dpitch}),
+  });
+}
+
+async function drag(x, y, action) {
+  // action: "press" | null | "release"
+  const body = {x, y};
+  if (action === "press")   { body.button = "left"; body.action = "press"; }
+  if (action === "release") { body.button = "left"; body.action = "release"; }
+  await fetch(`${API}/mouse/event`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+}
+```
+
+完整 Python 示例见 `remote_api/examples/webrtc_receiver.py`。
+
+---
+
+## 环境变量配置
+
+所有配置可用环境变量覆盖（前缀 `SPLAT_`），定义在 `remote_api/config.py`。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `SPLAT_BRIDGE_HOST` | `127.0.0.1` | C++ 桥接地址 |
+| `SPLAT_BRIDGE_PORT` | `7654` | C++ 桥接端口 |
+| `SPLAT_BRIDGE_TIMEOUT` | `11.0` | 单请求 socket 超时（秒） |
+| `SPLAT_HTTP_HOST` | `0.0.0.0` | HTTP 服务监听地址 |
+| `SPLAT_HTTP_PORT` | `8080` | HTTP 服务端口 |
+| `SPLAT_API_TOKEN` | `""` | 共享密钥（空=不鉴权） |
+
+```bash
+SPLAT_HTTP_PORT=9000 SPLAT_API_TOKEN=secret uvicorn remote_api.server:app --host 0.0.0.0
+# 之后所有请求须带：-H "X-Splat-Token: secret"
+```
+
+---
+
+## 故障排查
+
+| 现象 | 可能原因与处理 |
+|---|---|
+| `/health` 返回 503 `cannot reach Splatshop bridge` | Splatshop 未启动，或桥接端口被占用。检查控制台是否有 `RemoteControlServer: listening on 127.0.0.1:7654`；确认 `SPLAT_BRIDGE_PORT` 一致。 |
+| `/health` 503 但程序在运行 | 防火墙/端口转发问题。桥接仅监听 `127.0.0.1`，Python 必须与 Splatshop 同机，除非手动转发端口。 |
+| 502 `node not found: N` | node_id 失效（场景重载后 id 会变）。重新 `GET /scene/nodes` 取最新 id。 |
+| 502 `main thread did not respond within 10s` | 主线程卡死（如加载大场景）。等待恢复或重启。 |
+| 鼠标拖拽首帧视角跳变 | 轨道相机用 `mousePos` 差分。先发一次 `/mouse/move` 当前坐标建立基准，再发增量。 |
+| 旋转方向/Y 轴反 | 浏览器坐标 Y 向下、app 内部 Y 向上，桥接已做 `height - y` 翻转；若仍异常，确认传的是窗口内像素坐标而非屏幕坐标。 |
+| 快捷键重复触发 | 改为边沿触发：只在 keydown/keyup 调用 `/keyboard/key`，不要轮询。 |
+| 远程浏览器无法访问 | HTTP 默认 `0.0.0.0` 监听，检查防火墙放行 8080；生产环境务必设置 `SPLAT_API_TOKEN`。 |
+
+---
+
+## 相关文件
+
+- C++ 桥接：`src/remote/RemoteControlServer.h` / `.cpp`，`src/main.cpp`
+- Python API：`remote_api/`（`server.py`、`splat_client.py`、`models.py`、`keymap.py`、`config.py`）
+- 示例：`remote_api/examples/webrtc_receiver.py`
+- 底层：`include/OrbitControls.h`、`include/Runtime.h`、`include/MouseEvents.h`、`src/motion/MotionController.h`、`include/unsuck.hpp`（`EventQueue`）

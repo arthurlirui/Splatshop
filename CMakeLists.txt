@@ -23,6 +23,7 @@ file(GLOB SplatEditor_SOURCES CONFIGURE_DEPENDS
 	src/gui/*.*
 	src/motion/*.*
 	src/render/*.*
+	src/remote/*.*
 	src/scene/*.*
 	src/update/*.*
 	src/loader/*.*
