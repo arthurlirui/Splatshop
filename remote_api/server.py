@@ -204,16 +204,45 @@ _TEST_PAGE = r"""<!DOCTYPE html>
         <input id="singleKey" type="text" placeholder="如 W 或 SPACE" style="width:120px">
         <button onclick="pressOnce()">下发</button>
       </div>
-    </div>
+	    </div>
 
-    <div class="panel" style="margin-top:12px">
-      <h2>场景节点 / 刚体动画</h2>
+	    <div class="panel" style="margin-top:12px">
+	      <h2>场景 Splats 创建</h2>
+	      <div class="row" style="margin-top:6px">
+	        <label>类型</label>
+	        <select id="createType" style="background:#15151f;color:var(--fg);border:1px solid var(--border);padding:4px;border-radius:4px">
+	          <option>sphere</option><option>box</option><option>points</option>
+	        </select>
+	        <label>数量</label><input id="createCount" type="number" value="576" style="width:70px">
+	        <label>颜色</label><input id="createColor" type="text" value="1,0,0,1" style="width:100px" placeholder="r,g,b,a">
+	        <button onclick="createSplats()">创建</button>
+	      </div>
+	      <div id="sphereOpts" class="row" style="margin-top:4px">
+	        <label>中心</label><input id="scx" type="number" step="0.5" value="0"> <input id="scy" type="number" step="0.5" value="0"> <input id="scz" type="number" step="0.5" value="0">
+	        <label>半径</label><input id="sradius" type="number" step="0.1" value="1">
+	      </div>
+	      <div id="boxOpts" class="row" style="margin-top:4px; display:none">
+	        <label>min</label><input id="bx0" type="number" step="0.5" value="0"><input id="by0" type="number" step="0.5" value="0"><input id="bz0" type="number" step="0.5" value="0">
+	        <label>max</label><input id="bx1" type="number" step="0.5" value="2"><input id="by1" type="number" step="0.5" value="2"><input id="bz1" type="number" step="0.5" value="2">
+	      </div>
+	      <div id="pointsOpts" class="row" style="margin-top:4px; display:none">
+	        <label>scale</label><input id="ptScale" type="number" step="0.01" value="0.02">
+	      </div>
+	      <div class="row" style="margin-top:6px">
+	        <label>或加载文件</label>
+	        <input id="loadPath" type="text" placeholder="./splatmodels/scene.json" style="width:200px">
+	        <button onclick="loadFile()">加载</button>
+	      </div>
+	    </div>
+
+	    <div class="panel" style="margin-top:12px">
+	      <h2>场景节点 / 刚体动画</h2>
       <div class="row">
         <button onclick="refreshNodes()">刷新节点</button>
         <span id="selInfo" class="small">未选中</span>
       </div>
       <div style="max-height:160px; overflow:auto; margin-top:6px">
-        <table id="nodesTable"><thead><tr><th>id</th><th>name</th><th>type</th></tr></thead><tbody></tbody></table>
+	        <table id="nodesTable"><thead><tr><th>id</th><th>name</th><th>type</th><th>操作</th></tr></thead><tbody></tbody></table>
       </div>
       <div class="field" style="margin-top:8px"><label>动画目标 translation [x,y,z]</label>
         <input id="ax" type="number" step="0.5" value="1"> <input id="ay" type="number" step="0.5" value="0"> <input id="az" type="number" step="0.5" value="0">
@@ -376,7 +405,9 @@ async function refreshNodes(){
   const tb=document.querySelector('#nodesTable tbody'); tb.innerHTML='';
   j.nodes.forEach(n=>{
     const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${n.id}</td><td>${n.name}</td><td>${n.type}</td>`;
+    tr.innerHTML=`<td>${n.id}</td><td>${n.name}</td><td>${n.type}</td>
+      <td><button style="font-size:11px;padding:2px 5px;margin-right:2px" onclick="event.stopPropagation();removeNode(${n.id})">删除</button>
+      <button style="font-size:11px;padding:2px 5px" onclick="event.stopPropagation();setNodeColor(${n.id})">设色</button></td>`;
     tr.onclick=()=>{ selectedId=n.id;
       document.querySelectorAll('#nodesTable tr').forEach(r=>r.classList.remove('sel'));
       tr.classList.add('sel'); document.getElementById('selInfo').textContent=`选中 #${n.id} ${n.name}`; };
@@ -390,6 +421,37 @@ async function animateNode(){
               duration_s:+dur.value, ease:ease.value};
   const j=await post(`/motion/node/${selectedId}/animate`, body);
   if(j) log(`animate #${selectedId} -> ${JSON.stringify(body.target)}`);
+}
+
+// ---- 场景 Splats 创建 / 加载 / 删除 / 设色 ----
+document.getElementById('createType').onchange=function(){
+  const t=this.value; document.getElementById('sphereOpts').style.display=t==='sphere'?'flex':'none';
+  document.getElementById('boxOpts').style.display=t==='box'?'flex':'none';
+  document.getElementById('pointsOpts').style.display=t==='points'?'flex':'none';
+};
+function parseColorStr(s){ return s.split(',').map(parseFloat); }
+async function createSplats(){
+  const type=createType.value; let params={}; const cStr=document.getElementById('createColor').value;
+  params.color=parseColorStr(cStr); const count=+createCount.value;
+  if(type==='sphere'){ params.center=[+scx.value,+scy.value,+scz.value]; params.radius=+sradius.value; params.count=count; }
+  else if(type==='box'){ params.min=[+bx0.value,+by0.value,+bz0.value]; params.max=[+bx1.value,+by1.value,+bz1.value]; params.count=count; }
+  else if(type==='points'){ params.scale=+ptScale.value; params.count=count; params.positions=[]; for(let i=0;i<count;i++){ params.positions.push([Math.random()*4-2,Math.random()*4-2,Math.random()*4-2]); } }
+  const j=await post('/scene/splats/create', {type, params});
+  if(j){ log(`created ${type} node #${j.id} "${j.name}" x${j.count}`); refreshNodes(); }
+}
+async function loadFile(){
+  const p=loadPath.value.trim(); if(!p) return;
+  const j=await post('/scene/splats/load', {path:p}); if(j) { log('loaded '+p); refreshNodes(); }
+}
+async function removeNode(id){
+  if(!confirm('删除节点 #'+id+'？')) return;
+  const j=await call('DELETE','/scene/node/'+id);
+  if(j){ log('removed #'+id); refreshNodes(); }
+}
+async function setNodeColor(id){
+  const c=prompt('新颜色 r,g,b,a (0~1)','1,0,0,1'); if(!c) return;
+  const rgba=parseColorStr(c); const j=await post(`/scene/splats/${id}/color`, {color:rgba});
+  if(j) log(`set color #${id} to ${JSON.stringify(rgba)}`);
 }
 
 log('测试台就绪。先确认 Splatshop 与 C++ 桥接已启动。');
@@ -510,6 +572,41 @@ def keyboard_sequence(req: M.KeySequenceRequest):
 @app.get("/scene/nodes", dependencies=[Depends(_check_token)])
 def scene_nodes():
     return _call("scene.nodes")
+
+
+@app.post("/scene/splats/create", dependencies=[Depends(_check_token)])
+def scene_splats_create(req: M.SplatsCreateRequest):
+    """Create a new Gaussian splats cloud from geometry primitives.
+
+    type: "sphere" | "box" | "points". params depend on type (see models.py).
+    Returns the new node's id, name, and splat count.
+    """
+    cmd_map = {"sphere": "scene.splats.create_sphere",
+               "box":    "scene.splats.create_box",
+               "points": "scene.splats.create_points"}
+    cmd = cmd_map.get(req.type)
+    if not cmd:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            f"unknown type '{req.type}'; use sphere, box, or points")
+    return _call(cmd, req.params)
+
+
+@app.post("/scene/splats/load", dependencies=[Depends(_check_token)])
+def scene_splats_load(req: M.LoadFileRequest):
+    """Load splats from a .ply or scene.json file on the server's disk."""
+    return _call("scene.splats.load_file", {"path": req.path})
+
+
+@app.delete("/scene/node/{node_id}", dependencies=[Depends(_check_token)])
+def scene_node_remove(node_id: int):
+    """Remove a scene node by ID."""
+    return _call("scene.node.remove", {"id": node_id})
+
+
+@app.post("/scene/splats/{node_id}/color", dependencies=[Depends(_check_token)])
+def scene_splats_set_color(node_id: int, req: M.SetColorRequest):
+    """Overwrite the color of every splat in the given node."""
+    return _call("scene.splats.set_color", {"id": node_id, "color": req.color})
 
 
 @app.get("/motion/node/{node_id}/transform", dependencies=[Depends(_check_token)])

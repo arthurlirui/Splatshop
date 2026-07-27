@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <future>
 #include <mutex>
 #include <sstream>
@@ -26,6 +27,9 @@
 #include "../scene/SceneNode.h"
 #include "../motion/MotionController.h"
 #include "../motion/MotionTypes.h"
+#include "Splats.h"              // Splats struct + createSphere
+#include "../loader/GSPlyLoader.h"
+#include "../loader/SplatsyFilesLoader.h"
 
 // Sockets
 #ifdef _WIN32
@@ -442,6 +446,259 @@ static json cmd_motion_animate(const json& a) {
 	return json{{"duration_s", dur}, {"ease", easeS}};
 }
 
+// --- scene splats create / modify ------------------------------------------
+
+// Helper: attach a freshly-built Splats+SNSplats node to the scene.
+// Returns the new node's ID and name.
+static json attachSplatsNode(shared_ptr<Splats> splats, const glm::vec3& colorHint) {
+	(void)colorHint; // reserved for future per-node metadata
+	shared_ptr<SNSplats> node = make_shared<SNSplats>(splats->name, splats);
+	if(!SplatEditor::instance) throw runtime_error("editor not ready");
+	SplatEditor::instance->scene.world->children.push_back(node);
+	return json{{"id", node->ID}, {"name", node->name},
+	            {"count", splats->numSplats}};
+}
+
+// Convert float [0,1] RGBA to uint16 [0,65535].
+static void fillColor(uint16_t& r, uint16_t& g, uint16_t& b, uint16_t& a,
+                      const vector<float>& rgba) {
+	auto clamp = [](float v){ return v<0.0f?0.0f:(v>1.0f?1.0f:v); };
+	r = (uint16_t)(clamp(rgba[0]) * 65535.0f);
+	g = (uint16_t)(clamp(rgba[1]) * 65535.0f);
+	b = (uint16_t)(clamp(rgba[2]) * 65535.0f);
+	a = (uint16_t)(clamp(rgba.size()>3?rgba[3]:1.0f) * 65535.0f);
+}
+
+// Parse optional [r,g,b,a] or [r,g,b] from args.
+static bool parseColor(const json& args, const char* key, uint16_t& r, uint16_t& g,
+                       uint16_t& b, uint16_t& alpha, bool hasDefault) {
+	if(!args.contains(key) || args[key].is_null()) {
+		if(!hasDefault) return false;
+		r=g=b=0; alpha=65535; return true;
+	}
+	const json& v = args[key];
+	if(!v.is_array() || v.size()<3) return false;
+	float a4 = v.size() >= 4 ? v[3].get<float>() : 1.0f;
+	vector<float> rgba = {v[0].get<float>(), v[1].get<float>(), v[2].get<float>(), a4};
+	fillColor(r,g,b,alpha,rgba);
+	return true;
+}
+
+static json cmd_scene_splats_create_sphere(const json& a) {
+	// Required: radius. Optional: center (default origin), count (default 576), color.
+	float radius  = a.value("radius", 1.0f);
+	int   count   = a.value("count", 576);
+	float cx = 0, cy = 0, cz = 0;
+	if(a.contains("center")) {
+		const json& c = a["center"];
+		if(c.is_array() && c.size()>=3) { cx=c[0].get<float>(); cy=c[1].get<float>(); cz=c[2].get<float>(); }
+	}
+	uint16_t cr,cg,cb,ca;
+	parseColor(a, "color", cr,cg,cb,ca, true); // defaults to red if absent
+
+	shared_ptr<Splats> splats = make_shared<Splats>();
+	splats->name = "remote_sphere";
+	splats->numSplats = count;
+	splats->numSplatsLoaded = count;
+	splats->numSHCoefficients = 0;
+	splats->shDegree = 0;
+
+	splats->position = make_shared<Buffer>(12 * count);
+	splats->scale    = make_shared<Buffer>(12 * count);
+	splats->rotation = make_shared<Buffer>(16 * count);
+	splats->color    = make_shared<Buffer>(8  * count);
+
+	// Generate points on unit sphere then scale by radius + translate
+	for(int i=0; i<count; i++){
+		// Fibonacci sphere distribution for uniform coverage
+		float phi = acosf(1.0f - 2.0f*(i+0.5f)/count);
+		float theta = 3.14159265359f * (1.0f + sqrtf(5.0f)) * i;
+		float x = sinf(phi)*cosf(theta);
+		float y = sinf(phi)*sinf(theta);
+		float z = cosf(phi);
+		splats->position->set<float>(cx + x*radius, 12*i+0);
+		splats->position->set<float>(cy + y*radius, 12*i+4);
+		splats->position->set<float>(cz + z*radius, 12*i+8);
+		// Scale proportional to spacing
+		float s = radius * 3.0f / sqrtf((float)count);
+		splats->scale->set<float>(s, 12*i+0);
+		splats->scale->set<float>(s, 12*i+4);
+		splats->scale->set<float>(s, 12*i+8);
+		splats->rotation->set<float>(1.0f, 16*i+0); // w
+		splats->rotation->set<float>(0.0f, 16*i+4); // x
+		splats->rotation->set<float>(0.0f, 16*i+8); // y
+		splats->rotation->set<float>(0.0f, 16*i+12);// z
+		splats->color->set<uint16_t>(cr, 8*i+0);
+		splats->color->set<uint16_t>(cg, 8*i+2);
+		splats->color->set<uint16_t>(cb, 8*i+4);
+		splats->color->set<uint16_t>(ca, 8*i+6);
+	}
+	return attachSplatsNode(splats, glm::vec3(cr/65535.f,cg/65535.f,cb/65535.f));
+}
+
+static json cmd_scene_splats_create_points(const json& a) {
+	if(!a.contains("positions") || !a["positions"].is_array())
+		throw runtime_error("positions required (array of [x,y,z])");
+	const json& pts = a["positions"];
+	int count = (int)pts.size();
+	if(count == 0) throw runtime_error("positions is empty");
+
+	float defaultScale = a.value("scale", 0.02f);
+	uint16_t cr,cg,cb,ca;
+	parseColor(a, "color", cr,cg,cb,ca, true);
+
+	shared_ptr<Splats> splats = make_shared<Splats>();
+	splats->name = "remote_points";
+	splats->numSplats = count;
+	splats->numSplatsLoaded = count;
+	splats->numSHCoefficients = 0;
+	splats->shDegree = 0;
+
+	splats->position = make_shared<Buffer>(12 * count);
+	splats->scale    = make_shared<Buffer>(12 * count);
+	splats->rotation = make_shared<Buffer>(16 * count);
+	splats->color    = make_shared<Buffer>(8  * count);
+
+	for(int i=0; i<count; i++){
+		const json& p = pts[i];
+		if(!p.is_array() || p.size()<3) throw runtime_error("positions["+to_string(i)+"] invalid");
+		splats->position->set<float>(p[0].get<float>(), 12*i+0);
+		splats->position->set<float>(p[1].get<float>(), 12*i+4);
+		splats->position->set<float>(p[2].get<float>(), 12*i+8);
+		splats->scale->set<float>(defaultScale, 12*i+0);
+		splats->scale->set<float>(defaultScale, 12*i+4);
+		splats->scale->set<float>(defaultScale, 12*i+8);
+		splats->rotation->set<float>(1.0f, 16*i+0); // w
+		splats->rotation->set<float>(0.0f, 16*i+4);
+		splats->rotation->set<float>(0.0f, 16*i+8);
+		splats->rotation->set<float>(0.0f, 16*i+12);
+		splats->color->set<uint16_t>(cr, 8*i+0);
+		splats->color->set<uint16_t>(cg, 8*i+2);
+		splats->color->set<uint16_t>(cb, 8*i+4);
+		splats->color->set<uint16_t>(ca, 8*i+6);
+	}
+	return attachSplatsNode(splats, glm::vec3(cr/65535.f,cg/65535.f,cb/65535.f));
+}
+
+static json cmd_scene_splats_create_box(const json& a) {
+	if(!a.contains("min") || !a.contains("max"))
+		throw runtime_error("box requires min and max [x,y,z] arrays");
+	glm::vec3 mn, mx;
+	if(!getVec3f(a, "min", mn, true) || !getVec3f(a, "max", mx, true))
+		throw runtime_error("invalid min/max");
+	int count = a.value("count", 1000);
+	uint16_t cr,cg,cb,ca;
+	parseColor(a, "color", cr,cg,cb,ca, true);
+
+	float sx = mx.x-mn.x, sy = mx.y-mn.y, sz = mx.z-mn.z;
+	float volume = sx*sy*sz;
+	float spacing = cbrtf(volume / count);
+
+	shared_ptr<Splats> splats = make_shared<Splats>();
+	splats->name = "remote_box";
+	splats->numSplats = count;
+	splats->numSplatsLoaded = count;
+	splats->numSHCoefficients = 0;
+	splats->shDegree = 0;
+
+	splats->position = make_shared<Buffer>(12 * count);
+	splats->scale    = make_shared<Buffer>(12 * count);
+	splats->rotation = make_shared<Buffer>(16 * count);
+	splats->color    = make_shared<Buffer>(8  * count);
+
+	for(int i=0; i<count; i++){
+		// Random-uniform distribution in AABB
+		float rx = (float)rand()/RAND_MAX, ry = (float)rand()/RAND_MAX, rz = (float)rand()/RAND_MAX;
+		splats->position->set<float>(mn.x + rx*sx, 12*i+0);
+		splats->position->set<float>(mn.y + ry*sy, 12*i+4);
+		splats->position->set<float>(mn.z + rz*sz, 12*i+8);
+		splats->scale->set<float>(spacing, 12*i+0);
+		splats->scale->set<float>(spacing, 12*i+4);
+		splats->scale->set<float>(spacing, 12*i+8);
+		splats->rotation->set<float>(1.0f, 16*i+0);
+		splats->rotation->set<float>(0.0f, 16*i+4);
+		splats->rotation->set<float>(0.0f, 16*i+8);
+		splats->rotation->set<float>(0.0f, 16*i+12);
+		splats->color->set<uint16_t>(cr, 8*i+0);
+		splats->color->set<uint16_t>(cg, 8*i+2);
+		splats->color->set<uint16_t>(cb, 8*i+4);
+		splats->color->set<uint16_t>(ca, 8*i+6);
+	}
+	return attachSplatsNode(splats, glm::vec3(cr/65535.f,cg/65535.f,cb/65535.f));
+}
+
+static json cmd_scene_splats_load_file(const json& a) {
+	if(!a.contains("path") || !a["path"].is_string())
+		throw runtime_error("path required (string)");
+	string path = a["path"].get<string>();
+	if(!SplatEditor::instance) throw runtime_error("editor not ready");
+
+	if(!fs::exists(path)) throw runtime_error("file not found: " + path);
+
+	if(iEndsWith(path, ".ply")){
+		auto splats = GSPlyLoader::load(path);
+		return attachSplatsNode(splats, glm::vec3(1,0,0));
+	} else if(iEndsWith(path, ".json")){
+		SplatsyFilesLoader::load(path, SplatEditor::instance->scene, *Runtime::controls);
+		return json{{"msg", "scene loaded from " + path}};
+	}
+	throw runtime_error("unsupported file format (use .ply or .json): " + path);
+}
+
+static json cmd_scene_node_remove(const json& a) {
+	auto id = a.at("id").get<int64_t>();
+	if(!SplatEditor::instance) throw runtime_error("editor not ready");
+	Scene& scene = SplatEditor::instance->scene;
+
+	// Try world.children first (the common case)
+	auto& worldKids = scene.world->children;
+	for(size_t i=0; i<worldKids.size(); i++){
+		if(worldKids[i]->ID == id){ worldKids.erase(worldKids.begin()+i); return json{{"id",id}}; }
+	}
+	// General traversal: find parent, erase by raw pointer ID
+	bool removed = false;
+	scene.root->traverse([&](SceneNode* parent){
+		if(removed) return;
+		for(size_t i=0; i<parent->children.size(); i++){
+			if(parent->children[i]->ID == id){
+				parent->children.erase(parent->children.begin()+i);
+				removed = true; return;
+			}
+		}
+	});
+	if(!removed) throw runtime_error("node not found: " + to_string(id));
+	return json{{"id", id}};
+}
+
+static json cmd_scene_splats_set_color(const json& a) {
+	auto id = a.at("id").get<int64_t>();
+	if(!a.contains("color") || !a["color"].is_array() || a["color"].size()<3)
+		throw runtime_error("color required [r,g,b,a]");
+	const json& c = a["color"];
+	float a4 = c.size() >= 4 ? c[3].get<float>() : 1.0f;
+	vector<float> rgba = {c[0].get<float>(),c[1].get<float>(),c[2].get<float>(),a4};
+	uint16_t cr,cg,cb,ca; fillColor(cr,cg,cb,ca,rgba);
+
+	if(!SplatEditor::instance) throw runtime_error("editor not ready");
+	SceneNode* found = nullptr;
+	SplatEditor::instance->scene.root->traverse([&](SceneNode* n){ if(!found && n->ID==id) found=n; });
+	if(!found) throw runtime_error("node not found: " + to_string(id));
+	SNSplats* sn = dynamic_cast<SNSplats*>(found);
+	if(!sn) throw runtime_error("node is not a splats node: " + to_string(id));
+
+	uint32_t count = sn->dmng.data.count;
+	if(count == 0) throw runtime_error("splats node has no uploaded data");
+	// Write to GPU color buffer directly (cuMemcpyHtoD)
+	vector<uint16_t> colorBuf(4*count);
+	for(uint32_t i=0; i<count; i++){
+		colorBuf[4*i+0] = cr; colorBuf[4*i+1] = cg;
+		colorBuf[4*i+2] = cb; colorBuf[4*i+3] = ca;
+	}
+	cuMemcpyHtoD((CUdeviceptr)sn->dmng.data.color, colorBuf.data(), 4*count*sizeof(uint16_t));
+	return json{{"id", id}, {"count", count}, {"color", rgba}};
+}
+
+
 // ---------------------------------------------------------------------------
 // Command dispatch table. The dispatcher runs on the main thread.
 // ---------------------------------------------------------------------------
@@ -462,6 +719,12 @@ static const unordered_map<string, Handler>& handlers() {
 		{"mouse.event",           cmd_mouse_event},
 		{"keyboard.key",          cmd_keyboard_key},
 		{"scene.nodes",           cmd_scene_nodes},
+		{"scene.splats.create_sphere", cmd_scene_splats_create_sphere},
+		{"scene.splats.create_points", cmd_scene_splats_create_points},
+		{"scene.splats.create_box",    cmd_scene_splats_create_box},
+		{"scene.splats.load_file",     cmd_scene_splats_load_file},
+		{"scene.node.remove",     cmd_scene_node_remove},
+		{"scene.splats.set_color",cmd_scene_splats_set_color},
 		{"motion.get",            cmd_motion_get},
 		{"motion.set_transform",  cmd_motion_set_transform},
 		{"motion.translate",      cmd_motion_translate},

@@ -1,6 +1,6 @@
 # Splatshop 远程控制 API
 
-一套基于 Python (FastAPI) 的 HTTP API，将 Splatshop 渲染窗口的鼠标、键盘、相机与刚体运动控制暴露给远程的 WebRTC 接收端，实现远程视角与相机运动。
+一套基于 Python (FastAPI) 的 HTTP API，将 Splatshop 渲染窗口的鼠标、键盘、相机、刚体运动与高斯点云创建/修改控制暴露给远程的 WebRTC 接收端，实现远程视角与相机运动及场景编辑。
 
 > 目录
 > - [概述](#概述)
@@ -15,6 +15,7 @@
 >   - [鼠标](#鼠标)
 >   - [键盘](#键盘)
 >   - [场景与刚体运动](#场景与刚体运动)
+>   - [场景 Splats 操作](#场景-splats-操作)
 > - [WebRTC 接收端集成指南](#webrtc-接收端集成指南)
 > - [环境变量配置](#环境变量配置)
 > - [故障排查](#故障排查)
@@ -353,6 +354,80 @@ curl -X POST http://localhost:8080/motion/node/5/animate \
 
 ---
 
+### 场景 Splats 操作
+
+在场景中**创建、加载、删除、修改**高斯点云。创建走 `Splats` host-side 构建（position/scale/rotation/color Buffer），包装成 `SNSplats` 节点附加到 `scene.world`，下一帧由 `uploadSplats()` 自动上传 GPU。删除移除节点及其子节点。设色直接写 GPU color buffer。
+
+| 方法 | 路径 | 请求体 | 说明 |
+|---|---|---|---|
+| POST | `/scene/splats/create` | `{type, params}` | 从几何原语创建 splats |
+| POST | `/scene/splats/load` | `{path}` | 从服务端磁盘加载 .ply 或 scene.json |
+| DELETE | `/scene/node/{id}` | — | 删除节点 |
+| POST | `/scene/splats/{id}/color` | `{color:[r,g,b,a]}` | 设所有 splats 颜色 |
+
+**`POST /scene/splats/create`** — `type` 取值：
+
+| type | params | 说明 |
+|---|---|---|
+| `"sphere"` | `{center?, radius?, count?, color?}` | 球面均匀分布（Fibonacci sphere）。默认 center=[0,0,0], radius=1, count=576 |
+| `"box"` | `{min, max, count?, color?}` | 在 AABB 内随机均匀撒点。scale 自适应密度（cbrt(spacing)）|
+| `"points"` | `{positions:[[x,y,z],...], scale?, color?}` | 逐点指定位置。scale 默认 0.02 |
+
+```jsonc
+// sphere
+{"type":"sphere","params":{"center":[0,0,0],"radius":2,"count":500,"color":[0.2,0.6,1.0,1.0]}}
+// data
+{"id": 15, "name": "remote_sphere", "count": 500}
+
+// box
+{"type":"box","params":{"min":[0,0,0],"max":[3,3,3],"count":2000,"color":[1,0.5,0,1]}}
+
+// points
+{"type":"points","params":{"positions":[[0,0,0],[1,0,0],[2,0,0]],"scale":0.03,"color":[0,1,0,1]}}
+```
+```bash
+curl -X POST http://localhost:8080/scene/splats/create \
+  -H "Content-Type: application/json" \
+  -d '{"type":"sphere","params":{"radius":1.5,"count":300,"color":[0.2,0.8,1,1]}}'
+```
+
+> color 值为 float [0,1]，桥接转为 uint16 [0,65535]。scale 为 world 单位（非 log-scale）。
+
+**`POST /scene/splats/load`** — 路径相对于 Splatshop 工作目录：
+```jsonc
+{"path": "./splatmodels/scene.json"}
+// 或
+{"path": "E:/data/my_model.ply"}
+// data
+{"id": 16, "name": "my_model.ply", "count": 1234567}
+```
+```bash
+curl -X POST http://localhost:8080/scene/splats/load \
+  -H "Content-Type: application/json" -d '{"path":"./splatmodels/scene.json"}'
+```
+
+**`DELETE /scene/node/{id}`** — 删除节点及其所有子节点：
+```bash
+curl -X DELETE http://localhost:8080/scene/node/15
+# data
+{"id": 15}
+```
+
+**`POST /scene/splats/{id}/color`** — 把节点内所有 splats 颜色覆写为同一色（直接 cuMemcpyHtoD 到 GPU color buffer）：
+```jsonc
+{"color":[0.2,0.8,0.3,1.0]}
+// data
+{"id": 15, "count": 500, "color": [0.2,0.8,0.3,1.0]}
+```
+```bash
+curl -X POST http://localhost:8080/scene/splats/15/color \
+  -H "Content-Type: application/json" -d '{"color":[0.2,0.8,0.3,1]}'
+```
+
+> 设色仅修改 GPU 端的 `dmng.data.color`，不回溯 host 端 `Splats`（加载后 host 端已释放），且不影响 SHs。
+
+---
+
 ## 本地浏览器测试页（GET /test）
 
 服务内置一个自包含的测试控制页，用于在**本地浏览器**中验证鼠标/键盘/相机/刚体控制链路，无需任何 WebRTC 视频流。页面是纯 HTML/CSS/JS（无外部依赖），从同 origin 调用 API，因此没有 CORS 问题。
@@ -501,3 +576,4 @@ SPLAT_HTTP_PORT=9000 SPLAT_API_TOKEN=secret uvicorn remote_api.server:app --host
 - Python API：`remote_api/`（`server.py`、`splat_client.py`、`models.py`、`keymap.py`、`config.py`）
 - 示例：`remote_api/examples/webrtc_receiver.py`
 - 底层：`include/OrbitControls.h`、`include/Runtime.h`、`include/MouseEvents.h`、`src/motion/MotionController.h`、`include/unsuck.hpp`（`EventQueue`）
+- Splats 创建：`include/Splats.h`、`src/scene/SNSplats.h`、`src/scene/SceneNode.h`、`src/loader/GSPlyLoader.h`、`src/SplatsManagement.h`（`GaussianDataManager`）

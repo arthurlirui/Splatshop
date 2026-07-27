@@ -146,3 +146,45 @@ class AnimateRequest(BaseModel):
     target: Transform
     duration_s: Optional[float] = 1.0
     ease: Optional[EaseName] = "in_out"
+
+
+# --------------------------------------------------------------------------- #
+# Scene Splats creation / modification
+# --------------------------------------------------------------------------- #
+SplatsPrimitive = Literal["sphere", "box", "points"]
+
+
+class SphereParams(BaseModel):
+    """Create a sphere of Gaussian splats."""
+    center: Optional[List[float]] = Field(default=[0, 0, 0], min_length=3, max_length=3)
+    radius: Optional[float] = 1.0
+    count: Optional[int] = 576
+    color: Optional[List[float]] = Field(default=[1, 0, 0, 1], min_length=3, max_length=4)
+
+
+class BoxParams(BaseModel):
+    """Create splats filling an axis-aligned bounding box."""
+    min: List[float] = Field(..., min_length=3, max_length=3)
+    max: List[float] = Field(..., min_length=3, max_length=3)
+    count: Optional[int] = 1000
+    color: Optional[List[float]] = Field(default=[1, 0, 0, 1], min_length=3, max_length=4)
+
+
+class PointsParams(BaseModel):
+    """Create independent splats at explicit positions."""
+    positions: List[List[float]]
+    scale: Optional[float] = 0.02
+    color: Optional[List[float]] = Field(default=[1, 0, 0, 1], min_length=3, max_length=4)
+
+
+class SplatsCreateRequest(BaseModel):
+    type: SplatsPrimitive
+    params: Dict[str, Any]
+
+
+class LoadFileRequest(BaseModel):
+    path: str
+
+
+class SetColorRequest(BaseModel):
+    color: List[float] = Field(..., min_length=3, max_length=4)
