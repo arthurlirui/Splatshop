@@ -23,6 +23,8 @@ A precompiled windows binary is available [here](http://users.cg.tuwien.ac.at/ms
 	<li> No pip or conda issues! (no Python)
 	<li> CUDA Driver API - Can edit and hot-reload CUDA code like shaders.
 	<li> Includes support for <a href="https://github.com/nerficg-project/HTGS">perspective-correct gaussians</a>. (Splat models need to be trained with respective method)
+	<li> Object motion control and skeletal skinning (see <code>src/motion/</code>).
+	<li> HTTP-based remote control API: camera / mouse / keyboard / rigid-body motion / Gaussian splats creation, loading, deletion and coloring, drivable from local Python programs or remote WebRTC receivers (see <a href="#remote-control-api">Remote Control API</a>).
 </ul>
 
 ### Known Issues
@@ -43,29 +45,27 @@ A precompiled windows binary is available [here](http://users.cg.tuwien.ac.at/ms
 <summary>Windows</summary>
 
 Dependencies: 
-* CUDA 12.4
-* Visual Studio 2022 (version 17.10.3)
-* CMake 3.27
-* RTX 4070 or better recommended. 
+* CUDA 12.4 or later
+* Visual Studio 2022 (version 17.10.3 or later)
+* CMake 3.22 or later
+* RTX 4070 or better recommended (RTX 5090 also verified).
 
-Create Visual Studio solution files in a build folder via cmake:
+Generate the Visual Studio solution and build the Release binary from the command line:
 
-```
-mkdir build
-cd build
-cmake ../
-```
+```bash
+# 1. Configure (generates build/SplatEditor.sln)
+cmake -B build -S .
 
-Open build/SplatEditor.sln and compile in Release mode.<br>
-Then run from project directory. 
+# 2. Build the Release target
+cmake --build build --config Release --target SplatEditor
 
-```
+# 3. Run from the repository root so resources resolve correctly
 ./build/Release/SplatEditor.exe
 ```
 
-Running from project directory is semi-important because the editor will look for resources such as ```./src/gaussians_rendering.cu``` and ```./resources/images/symbols_32_32.png``` relative to the project directory. Alternatively, you can copy the resources and src folders into the binary directory.
+Alternatively, open `build/SplatEditor.sln` in Visual Studio and compile in `Release` mode.
 
-
+Running from the project directory is semi-important because the editor will look for resources such as ```./src/gaussians_rendering.cu``` and ```./resources/images/symbols_32_32.png``` relative to the project directory. Alternatively, you can copy the resources and src folders into the binary directory.
 
 </details>
 
@@ -77,7 +77,7 @@ Dependencies:
 * CUDA 12.4 or higher
 * NVIDIA driver version 550 or higher. (Lower may cause issues when compiling GPUSorting)
 
-```
+```bash
 mkdir build
 cd build
 export CUDA_PATH=/usr/local/cuda-12.4/
@@ -98,8 +98,81 @@ export LD_LIBRARY_PATH=~/gcc-14.1.0/x86_64-linux-gnu/libstdc++-v3/src/.libs:$LD_
 // run from workspace root
 ./build/SplatEditor
 ```
-
 </details>
+
+## Remote Control API
+
+Splatshop ships with an optional out-of-process HTTP API that exposes the running editor to other local programs or remote clients (e.g. a WebRTC receiver). It is a two-layer bridge:
+
+```
+remote client (HTTP)  ──►  remote_api/ (FastAPI, Python)  ──►  TCP JSON-RPC  ──►  Splatshop C++ (RemoteControlServer)
+```
+
+* **C++ side** (`src/remote/RemoteControlServer.{h,cpp}`) is built into `SplatEditor.exe` and listens on TCP port `7654` by default. It dispatches commands to the main thread via the existing `schedule()` event queue, so it is safe with CUDA / OpenGL contexts.
+* **Python side** (`remote_api/`) is a FastAPI server that translates HTTP requests into newline-delimited JSON-RPC calls against the C++ bridge. It exposes camera, mouse, keyboard, rigid-body motion and Gaussian splats creation/loading/deletion/coloring endpoints, plus a self-contained browser test page at `GET /test`.
+
+Capabilities exposed over the API:
+
+| Category | Examples |
+|---|---|
+| Camera | orbit / pan / zoom / set pose / focus on bounding box |
+| Mouse | move, button press/release, scroll, raw events |
+| Keyboard | key press/release, key sequences (GLFW key names) |
+| Scene / rigid body | list nodes, get/set/translate/rotate/scale/anime transform |
+| Splats | create sphere / box / points clouds, load `.ply` / `scene.json`, remove node, set color |
+
+### Setup (Python frontend)
+
+The Python frontend is independent of the C++ build and can run in a dedicated conda environment:
+
+```bash
+# Option A: conda (recommended, see environment.yml)
+conda env create -f environment.yml
+conda activate splat-remote
+
+# Option B: plain pip
+pip install -r remote_api/requirements.txt
+```
+
+### Running
+
+```bash
+# 1. Start Splatshop (the C++ editor) from the repo root
+./build/Release/SplatEditor.exe
+
+# 2. Start the Python HTTP API (default port 8080)
+uvicorn remote_api.server:app --host 0.0.0.0 --port 8080
+
+# 3. Open the browser test page
+#    http://localhost:8080/test
+```
+
+Environment variables (all optional):
+
+| Variable | Default | Description |
+|---|---|---|
+| `SPLAT_BRIDGE_HOST` | `127.0.0.1` | C++ bridge host |
+| `SPLAT_BRIDGE_PORT` | `7654` | C++ bridge port |
+| `SPLAT_API_TOKEN` | _(unset)_ | If set, clients must send `Authorization: Bearer <token>` |
+| `SPLAT_API_PORT` | `8080` | Override the API listen port |
+
+### Quick example
+
+Create a sphere of splats from a remote client and move it:
+
+```bash
+# Create a sphere of 500 red splats, returns {"id": 15, ...}
+curl -X POST http://localhost:8080/scene/splats/create \
+  -H "Content-Type: application/json" \
+  -d '{"type":"sphere","params":{"radius":1.5,"count":500,"color":[1,0,0,1]}}'
+
+# Animate node 15 to translation [3,0,0] over 1.5s
+curl -X POST http://localhost:8080/motion/node/15/animate \
+  -H "Content-Type: application/json" \
+  -d '{"target":{"translation":[3,0,0]},"duration_s":1.5,"ease":"in_out"}'
+```
+
+Full endpoint reference, schemas, WebRTC integration guide and troubleshooting live in [`docs/remote_api.md`](docs/remote_api.md).
 
 ## Getting Started
 
