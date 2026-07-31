@@ -116,6 +116,7 @@ struct SplatEditor{
 	CudaModularProgram* prog_gaussians_rendering = nullptr;
 	CudaModularProgram* prog_gaussians_editing = nullptr;
 	CudaModularProgram* prog_points = nullptr;
+	CudaModularProgram* prog_progressive_points = nullptr; // Skye-style progressive point-cloud renderer (port to CUDA)
 	CudaModularProgram* prog_triangles = nullptr;
 	CudaModularProgram* prog_lines = nullptr;
 	CudaModularProgram* prog_helpers = nullptr;
@@ -224,9 +225,21 @@ struct SplatEditor{
 		bool cullSmallSplats             = true;
 		bool requestDebugDump            = false;
 		bool enableOverlapped            = true;
-		int splatRenderer                = SPLATRENDERER_3DGS;
-		int intersectionMode             = INTERSECTION_APPROXIMATE;
-		int brushColorMode               = BRUSHCOLORMODE_NORMAL;
+	int splatRenderer                = SPLATRENDERER_3DGS;
+	int intersectionMode             = INTERSECTION_APPROXIMATE;
+	int brushColorMode               = BRUSHCOLORMODE_NORMAL;
+
+	// Point-cloud renderer selection. HQS (the existing path in points.cu) draws
+	// every point every frame via atomicMin-depth + atomicAdd-color; PROGRESSIVE
+	// is the Skye-style port (progressive_points.cu) that scales to hundreds of
+	// millions of points by reprojecting last frame + filling a budget of new
+	// points per frame.
+	int pointRenderer                = POINTRENDERER_HQS;
+	uint32_t progressiveBudget       = 1'000'000;   // points filled per frame (fixed mode)
+	float progressivePointSize       = 1.0f;
+	bool progressiveAdaptiveBudget   = false;       // GPU-timer-driven adaptive fill
+	float progressiveTargetFrameMs   = 16.0f;       // target frame time for adaptive mode
+	bool progressiveResetRequested   = false;       // host: clear reproject buffer next frame
 
 		Brush brush;
 		RectSelect rectselect;
@@ -250,9 +263,11 @@ struct SplatEditor{
 		bool showFileSaveDialog = false;
 		bool showGettingStarted = false;
 		bool showColorCorrection = false;
-		bool showToolbar = true;
-		bool showMotion = false;
-		bool openContextMenu = false;
+	bool showToolbar = true;
+	bool showMotion = false;
+	bool showPointCloud = false;          // progressive point-cloud control panel
+	bool showPointCloudLoadDialog = false;
+	bool openContextMenu = false;
 
 		bool showInset = false;
 		float dbg_factor = 1.0f;
@@ -405,6 +420,7 @@ struct SplatEditor{
 	void makeSaveFileGUI();
 	void makeGettingStarted();
 	void makeMotionGUI();
+	void makePointCloudGUI();
 
 	// MISC
 	CudaGlMappings mapCudaGl(shared_ptr<GLTexture> source);

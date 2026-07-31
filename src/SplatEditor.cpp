@@ -1542,6 +1542,7 @@ void SplatEditor::initCudaProgram(){
 		{&prog_gaussians_rendering,  "./src/gaussians_rendering.cu"},
 		{&prog_gaussians_editing,    "./src/gaussians_editing.cu"},
 		{&prog_points,               "./src/render/points.cu"},
+		{&prog_progressive_points,   "./src/render/progressive_points.cu"},
 		{&prog_triangles,            "./src/render/triangles.cu"},
 		{&prog_lines,                "./src/render/lines.cu"},
 		{&prog_helpers,              "./src/render/helpers.cu"},
@@ -1725,6 +1726,7 @@ void SplatEditor::drawGUI() {
 		makeSaveFileGUI();
 		makeGettingStarted();
 		makeMotionGUI();
+		makePointCloudGUI();
 
 		// { // PROTOTYPING / DEBUG: Toggle between 3DGS and perspective correct scenes and rendering
 
@@ -2336,3 +2338,4 @@ int32_t SplatEditor::getNumDeletedSplats(){
 #include "gui/saveFile.h"
 #include "gui/gettingStarted.h"
 #include "gui/motion.h"
+#include "gui/pointcloud.h"

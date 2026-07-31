@@ -44,6 +44,10 @@ void SplatEditor::makeMenubar(){
 				settings.showFileSaveDialog = true;
 			}
 
+			if (ImGui::MenuItem("Load Point Cloud...", "")) {
+				settings.showPointCloudLoadDialog = true;
+			}
+
 			// ImGui::Separator();
 
 			// if (ImGui::MenuItem("Quit", "Esc")) {
@@ -93,6 +97,12 @@ void SplatEditor::makeMenubar(){
 		startHighlightButtonIf(editor->settings.showMotion);
 		if(ImGui::Button("Motion")){
 			editor->settings.showMotion = !editor->settings.showMotion;
+		}
+		endHighlightButtonIf();
+
+		startHighlightButtonIf(editor->settings.showPointCloud);
+		if(ImGui::Button("Point Cloud")){
+			editor->settings.showPointCloud = !editor->settings.showPointCloud;
 		}
 		endHighlightButtonIf();
 

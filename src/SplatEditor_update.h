@@ -210,6 +210,40 @@ void SplatEditor::update(){
 			pd.count += numToUpload;
 			pd.numUploaded += numToUpload;
 		}
+
+		// Once the cloud is fully loaded AND fully uploaded, build the Skye-style
+		// progressive (shuffled) buffers and run the load-time permutation. After
+		// this, a contiguous draw over the shuffled buffer uniformly samples the
+		// whole cloud, which is what makes the per-frame fill budget bounded. We
+		// only do this when the user has selected the progressive renderer; the
+		// HQS path ignores the shuffled buffers entirely.
+		bool fullyLoaded   = (int64_t)points->numPointsLoaded == points->numPoints && points->numPoints > 0;
+		bool fullyUploaded = pd.numUploaded == (int)numLoaded && numLoaded > 0;
+		if(settings.pointRenderer == POINTRENDERER_PROGRESSIVE
+			&& fullyLoaded && fullyUploaded
+			&& !node->progressiveInitialized
+			&& prog_progressive_points != nullptr)
+		{
+			uint64_t numPoints = uint64_t(pd.count);
+			node->progressive.init(numPoints);
+			node->progressiveInitialized = true;
+
+			// Scatter canonical {pos,color} into permuted slots. One thread per
+			// point. Runs on mainstream so it's ordered after the uploads above.
+			ProgressivePointData pc = node->progressive.data;
+			prog_progressive_points->launch(
+				"kernel_progressive_distribute",
+				{&launchArgs, &pd, &pc},
+				int(numPoints), mainstream);
+
+			// Mark ready once the scatter is dispatched. drawpoints_progressive
+			// checks pc.ready before touching the shuffled buffers, and the
+			// kernels run on mainstream so the dispatch ordering is guaranteed.
+			node->progressive.data.ready = true;
+
+			println("Progressive: shuffled {:L} points (prime={}, {} buffers) for \"{}\"",
+				numPoints, node->progressive.prime, node->progressive.numBuffers, node->name);
+		}
 	});
 
 	

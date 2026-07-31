@@ -1,6 +1,7 @@
 #include "gui/ImguiPage.h"
 #include "gui/guivr.h"
 #include "scene/SN4DGSSplats.h"
+#include "scene/ProgressivePointData.h"
 
 struct ConcurrentTarget{
 	RenderTarget target;
@@ -28,6 +29,195 @@ struct ConcurrentTarget{
 	uint32_t numVisibleSplats;
 	uint32_t numFragments;
 };
+
+// Per-target progressive-render state, cached across frames like ConcurrentTarget.
+// Mirrors Skye's render_progressive.js state (reproject VBO, index image, indirect
+// command) but in CUDA: a compaction buffer of ProgressiveVertex, a per-pixel
+// uint32 index image (0xFFFFFFFF = empty), and an indirect command struct.
+struct ProgressiveTarget {
+	RenderTarget target;
+	shared_ptr<CudaVirtualMemory> virt_indexImage;        // uint32 per pixel
+	shared_ptr<CudaVirtualMemory> virt_reprojectBuffer;   // ProgressiveVertex[]
+	shared_ptr<CudaVirtualMemory> virt_indirect;          // ProgressiveIndirectCommand
+
+	CUdeviceptr cptr_indexImage = 0;
+	CUdeviceptr cptr_reprojectBuffer = 0;
+	CUdeviceptr cptr_indirect = 0;
+
+	// Host-visible mirror of the indirect command's `count`, so we can launch
+	// the reproject kernel over exactly the right number of threads without a
+	// device->host sync per frame (we read it back via a pinned staging copy).
+	ProgressiveIndirectCommand* hostIndirect = nullptr;
+	CUdeviceptr devStagingIndirect = 0;
+
+	uint32_t reprojectCapacity = 0;   // max ProgressiveVertex entries allocated
+	bool initialized = false;
+
+	// Adaptive-budget throughput estimate (points/ms), updated each frame.
+	float pointsPerMs = 0.0f;
+	CUevent evFillStart = 0;
+	CUevent evFillEnd = 0;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Progressive point rendering — the Skye-style port.
+//
+// One ProgressiveTarget is cached per RenderTarget (keyed by framebuffer
+// pointer + size), holding the reproject VBO, the per-pixel index image, and
+// the indirect command. Per frame, for each ready SNPoints node:
+//   clear_index -> reproject (last frame's visible pts) -> fill (budget of new
+//   shuffled pts) -> create_vbo (compact visible pts into next frame's VBO).
+//
+// v1 follows Skye's single-active-cloud model: only the first ready node is
+// rendered progressively; additional ready nodes are skipped here (they would
+// need per-node reproject buffers — Phase 3). All points write into the shared
+// target.framebuffer with the (depth<<32)|color + atomicMin convention.
+// ─────────────────────────────────────────────────────────────────────────────
+inline void drawpoints_progressive(
+	vector<SNPoints*> nodes,
+	RenderTarget target,
+	CUstream mainstream
+){
+	if(nodes.size() == 0) return;
+
+	auto editor = SplatEditor::instance;
+	auto& settings = editor->settings;
+	auto prog = editor->prog_progressive_points;
+	if(prog == nullptr) return;
+
+	SNPoints* node = nodes[0];
+	ProgressivePointData pc = node->progressive.data;
+	if(!pc.ready || pc.count == 0u) return;
+
+	mat4 transform = node->transform_global;
+
+	// Lazily grow / (re)allocate the per-target progressive cache. Keyed on the
+	// framebuffer pointer + dimensions so a resized target gets a fresh buffer.
+	static vector<ProgressiveTarget> cache;
+	ProgressiveTarget* pt = nullptr;
+	for(auto& c : cache){
+		if(c.target.framebuffer == target.framebuffer &&
+		   c.target.width == target.width && c.target.height == target.height){
+			pt = &c;
+			break;
+		}
+	}
+
+	uint32_t numPixels = uint32_t(target.width) * uint32_t(target.height);
+	// Cap the reproject buffer at one entry per pixel (a point can occupy at
+	// most one pixel after dedup), rounded up for virtual-memory granularity.
+	uint32_t reprojectCapacity = numPixels;
+
+	if(pt == nullptr){
+		ProgressiveTarget fresh;
+		fresh.target = target;
+
+		fresh.virt_indexImage = CudaVirtualMemory::create();
+		fresh.virt_indexImage->commit(numPixels * sizeof(uint32_t));
+		fresh.cptr_indexImage = fresh.virt_indexImage->cptr;
+
+		fresh.virt_reprojectBuffer = CudaVirtualMemory::create();
+		fresh.virt_reprojectBuffer->commit(reprojectCapacity * sizeof(ProgressiveVertex));
+		fresh.cptr_reprojectBuffer = fresh.virt_reprojectBuffer->cptr;
+
+		fresh.virt_indirect = CudaVirtualMemory::create();
+		fresh.virt_indirect->commit(sizeof(ProgressiveIndirectCommand));
+		fresh.cptr_indirect = fresh.virt_indirect->cptr;
+
+		// Pinned host mirror for reading the indirect count back without a
+		// full device->host copy each frame.
+		cuMemAllocHost((void**)&fresh.hostIndirect, sizeof(ProgressiveIndirectCommand));
+		fresh.hostIndirect->count = 0;
+
+		cuEventCreate(&fresh.evFillStart, CU_EVENT_DEFAULT);
+		cuEventCreate(&fresh.evFillEnd, CU_EVENT_DEFAULT);
+
+		fresh.reprojectCapacity = reprojectCapacity;
+		fresh.initialized = true;
+
+		cache.push_back(std::move(fresh));
+		pt = &cache.back();
+	}
+
+	// Grow buffers if the target grew.
+	if(pt->reprojectCapacity < reprojectCapacity){
+		pt->virt_reprojectBuffer->commit(reprojectCapacity * sizeof(ProgressiveVertex));
+		pt->cptr_reprojectBuffer = pt->virt_reprojectBuffer->cptr;
+		pt->reprojectCapacity = reprojectCapacity;
+	}
+	if(uint64_t(pt->virt_indexImage->comitted) < uint64_t(numPixels) * sizeof(uint32_t)){
+		pt->virt_indexImage->commit(numPixels * sizeof(uint32_t));
+		pt->cptr_indexImage = pt->virt_indexImage->cptr;
+	}
+
+	// Optional reset (from GUI "Reset progressive"): clear the reproject buffer
+	// so the next frame rebuilds the image from scratch.
+	if(settings.progressiveResetRequested){
+		cuMemsetD32Async(pt->cptr_indirect, 0, sizeof(ProgressiveIndirectCommand) / 4, mainstream);
+		pt->hostIndirect->count = 0;
+		settings.progressiveResetRequested = false;
+	}
+
+	// Stage 0: clear the per-pixel index image (0xFFFFFFFF = empty).
+	prog->launch("kernel_progressive_clear_index",
+		{&editor->launchArgs, &target, &pt->cptr_indexImage}, numPixels, mainstream);
+
+	// Read last frame's indirect count back to the host so we launch reproject
+	// over exactly that many threads. This is a tiny (20-byte) async copy; we
+	// synchronize on it before launching.
+	cuMemcpyDtoHAsync(pt->hostIndirect, pt->cptr_indirect, sizeof(ProgressiveIndirectCommand), mainstream);
+	cuStreamSynchronize(mainstream);
+	uint32_t reprojectCount = pt->hostIndirect->count;
+	if(reprojectCount > reprojectCapacity) reprojectCount = reprojectCapacity;
+
+	// Stage 1: reproject last frame's visible points.
+	if(reprojectCount > 0){
+		prog->launch("kernel_progressive_reproject",
+			{&editor->launchArgs, &target, &pt->cptr_indexImage,
+			 &pt->cptr_reprojectBuffer, &pt->cptr_indirect, &transform},
+			reprojectCount, mainstream);
+	}
+
+	// Stage 2: fill a budget of fresh shuffled points into holes.
+	// (Phase 1 uses a fixed budget from the GUI slider. The adaptive-budget
+	// kernel kernel_progressive_compute_fill — port of compute_fill.cs — is wired
+	// in Phase 2 using evFillStart/evFillEnd to measure reproject+fill time and
+	// self-regulate against progressiveTargetFrameMs.)
+	uint32_t budget = settings.progressiveBudget;
+	budget = std::min(budget, pc.count);
+
+	prog->launch("kernel_progressive_fill",
+		{&editor->launchArgs, &target, &pt->cptr_indexImage, &pc,
+		 &pc.fillOffset, &budget, &transform},
+		budget, mainstream);
+
+	// Advance the fill cursor (wraps around the cloud). The kernel reads
+	// pc.fillOffset by value, so we update the host copy and will re-upload it
+	// via the by-value struct next frame. (pc is a host copy of the node's
+	// ProgressivePointData; the node's own fillOffset is advanced in update().)
+	node->progressive.data.fillOffset =
+		(node->progressive.data.fillOffset + budget) % pc.count;
+
+	// Stage 3: rebuild next frame's reproject buffer from the index image.
+	// Reset the indirect count first so create_vbo's atomicAdd compaction starts
+	// from zero.
+	prog->launch("kernel_progressive_reset_indirect",
+		{&editor->launchArgs, &pt->cptr_indirect}, 1, mainstream);
+
+	// One thread per framebuffer pixel. CudaModularProgram only exposes 1D grids,
+	// so flatten width*height into a 1D launch; the kernel recovers (gx,gy) from
+	// the flat thread rank. create_vbo stores LOCAL positions (no transform) —
+	// reproject applies the node's current world transform next frame.
+	{
+		uint32_t numPixelsCreate = uint32_t(target.width) * uint32_t(target.height);
+		uint32_t blocksize = 256;
+		uint32_t gridsize = (numPixelsCreate + blocksize - 1) / blocksize;
+		prog->launch("kernel_progressive_create_vbo",
+			{&editor->launchArgs, &target, &pt->cptr_indexImage,
+			 &pt->cptr_indirect, &pt->cptr_reprojectBuffer, &pc},
+			{.gridsize = gridsize, .blocksize = blocksize, .stream = mainstream});
+	}
+}
 
 void dump_tile(ConcurrentTarget& target, uint32_t numTiles){
 
@@ -1475,33 +1665,57 @@ void SplatEditor::draw(Scene* scene, vector<RenderTarget> targets){
 		prog_gaussians_rendering->launch("kernel_clearFramebuffer", {&launchArgs, &target}, target.width * target.height, mainstream);
 
 		if(nodes.size() > 0)
-		{ // RENDER POINTS - HQ
+		{ // RENDER POINTS
 
-			shared_ptr<CudaVirtualMemory> virt_fb_depth = concurrent.virt_fb_depth;
-			shared_ptr<CudaVirtualMemory> virt_fb_color = concurrent.virt_fb_color;
-
-			virt_fb_depth->commit(target.width * target.height * 4);
-			virt_fb_color->commit(target.width * target.height * 16);
-
-			uint32_t INF = 0x7f800000;
-			cuMemsetD32Async(virt_fb_depth->cptr, INF, target.width * target.height, mainstream);
-			cuMemsetD32Async(virt_fb_color->cptr, 0, 4 * target.width * target.height, mainstream);
-
-			float pointSize = 0.5f;
-
-			// depthmap
+			// Split nodes into progressive (shuffled & ready) and HQS (everything
+			// else). Each path writes into target.framebuffer using the shared
+			// (depth<<32)|color + atomicMin convention, so they compose with the
+			// clear above and with each other. The HQS path additionally uses
+			// the per-target fb_depth/fb_color scratch buffers.
+			vector<SNPoints*> hqsNodes;
+			vector<SNPoints*> progressiveNodes;
 			for(SNPoints* node : nodes){
-				prog_points->launch("kernel_hqs_depth", {&launchArgs, &node->manager.data, &target, &virt_fb_depth->cptr, &virt_fb_color->cptr, &pointSize}, node->manager.data.count, mainstream);
+				if(settings.pointRenderer == POINTRENDERER_PROGRESSIVE && node->progressive.data.ready){
+					progressiveNodes.push_back(node);
+				}else{
+					hqsNodes.push_back(node);
+				}
 			}
 
-			// colors
-			for(SNPoints* node : nodes){
-				prog_points->launch("kernel_hqs_color", {&launchArgs, &node->manager.data, &target, &virt_fb_depth->cptr, &virt_fb_color->cptr, &pointSize}, node->manager.data.count, mainstream);
+			if(hqsNodes.size() > 0)
+			{ // RENDER POINTS - HQS (existing path)
+
+				shared_ptr<CudaVirtualMemory> virt_fb_depth = concurrent.virt_fb_depth;
+				shared_ptr<CudaVirtualMemory> virt_fb_color = concurrent.virt_fb_color;
+
+				virt_fb_depth->commit(target.width * target.height * 4);
+				virt_fb_color->commit(target.width * target.height * 16);
+
+				uint32_t INF = 0x7f800000;
+				cuMemsetD32Async(virt_fb_depth->cptr, INF, target.width * target.height, mainstream);
+				cuMemsetD32Async(virt_fb_color->cptr, 0, 4 * target.width * target.height, mainstream);
+
+				float pointSize = 0.5f;
+
+				// depthmap
+				for(SNPoints* node : hqsNodes){
+					prog_points->launch("kernel_hqs_depth", {&launchArgs, &node->manager.data, &target, &virt_fb_depth->cptr, &virt_fb_color->cptr, &pointSize}, node->manager.data.count, mainstream);
+				}
+
+				// colors
+				for(SNPoints* node : hqsNodes){
+					prog_points->launch("kernel_hqs_color", {&launchArgs, &node->manager.data, &target, &virt_fb_depth->cptr, &virt_fb_color->cptr, &pointSize}, node->manager.data.count, mainstream);
+				}
+
+				// normalize and transfer to target.framebuffer
+				uint32_t numPixels = target.width * target.height;
+				prog_points->launch("kernel_hqs_normalize", {&launchArgs, &target, &virt_fb_depth->cptr, &virt_fb_color->cptr}, numPixels, mainstream);
 			}
 
-			// normalize and transfer to target.framebuffer
-			uint32_t numPixels = target.width * target.height;
-			prog_points->launch("kernel_hqs_normalize", {&launchArgs, &target, &virt_fb_depth->cptr, &virt_fb_color->cptr}, numPixels, mainstream);
+			if(progressiveNodes.size() > 0)
+			{ // RENDER POINTS - PROGRESSIVE (Skye-style port)
+				drawpoints_progressive(progressiveNodes, target, mainstream);
+			}
 		}
 
 		{ // RENDER TRIANGLES

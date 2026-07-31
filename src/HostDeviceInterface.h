@@ -57,6 +57,15 @@ constexpr int BRUSHCOLORMODE_HUE_SATURATION = 1;
 constexpr int SPLATRENDERER_3DGS = 0;
 constexpr int SPLATRENDERER_PERSPECTIVE_CORRECT = 1;
 
+// Point-cloud renderer selection (SplatEditor.settings.pointRenderer).
+// HQS = existing high-quality-splatting compute path (points.cu), draws all
+//        points every frame (atomicMin depth -> atomicAdd color -> resolve).
+// PROGRESSIVE = Skye-style progressive path (progressive_points.cu); reprojects
+//        last frame + fills a per-frame budget of shuffled points, scaling to
+//        hundreds of millions of points without hierarchical structures.
+constexpr int POINTRENDERER_HQS = 0;
+constexpr int POINTRENDERER_PROGRESSIVE = 1;
+
 constexpr uint32_t FLAGS_SELECTED             = 1 <<  0;
 constexpr uint32_t FLAGS_HIGHLIGHTED          = 1 <<  1;
 constexpr uint32_t FLAGS_HIGHLIGHTED_NEGATIVE = 1 <<  2;

@@ -6,6 +6,8 @@
 #include "loader/SplatsyLoader.h"
 #include "loader/GLBLoader.h"
 #include "loader/LASLoader.h"
+#include "loader/BINPointCloudLoader.h"
+#include "loader/PointCloudPlyLoader.h"
 
 #include "Runtime.h"
 #include "CURuntime.h"
@@ -319,7 +321,7 @@ int main(){
 	initScene();
 
 	glfwSetDropCallback(GLRenderer::window, [](GLFWwindow* window, int count, const char** paths){
-		
+
 		for(int i = 0; i < count; i++){
 			string path = paths[i];
 
@@ -327,10 +329,43 @@ int main(){
 				if(iEndsWith(path, ".json")){
 					SplatsyFilesLoader::load(path, editor->scene, *Runtime::controls);
 				}else if(iEndsWith(path, ".ply")){
-					auto splats = GSPlyLoader::load(path);
-					shared_ptr<SNSplats> node = make_shared<SNSplats>(splats->name, splats);
-					editor->scene.world->children.push_back(node);
-					editor->setSelectedNode(node.get());
+					// PLY is ambiguous: gaussian-splat PLYs (with scale_*/rot_*/f_dc_*
+					// properties) go through GSPlyLoader as SNSplats; plain point-cloud
+					// PLYs (just x/y/z [+r/g/b]) go through PointCloudPlyLoader as
+					// SNPoints. The point-cloud loader detects and rejects splat PLYs,
+					// so try it first and fall back to the splat loader on failure.
+					if(auto points = PointCloudPlyLoader::load(path)){
+						shared_ptr<SNPoints> node = make_shared<SNPoints>(points->name, points);
+						editor->scene.world->children.push_back(node);
+						editor->setSelectedNode(node.get());
+						Runtime::controls->focus(points->min, points->max, 1.0f);
+					}else{
+						auto splats = GSPlyLoader::load(path);
+						shared_ptr<SNSplats> node = make_shared<SNSplats>(splats->name, splats);
+						editor->scene.world->children.push_back(node);
+						editor->setSelectedNode(node.get());
+					}
+				}else if(iEndsWith(path, ".las")){
+					// Point cloud: LAS → SNPoints. Loads incrementally on a background
+					// thread; SplatEditor_update.h streams it to the device each frame.
+					// If the progressive renderer is selected, the upload-complete
+					// hook in update() builds the shuffled buffers automatically.
+					auto points = LasLoader::load(path);
+					if(points){
+						shared_ptr<SNPoints> node = make_shared<SNPoints>(points->name, points);
+						editor->scene.world->children.push_back(node);
+						editor->setSelectedNode(node.get());
+						Runtime::controls->focus(points->min, points->max, 1.0f);
+					}
+				}else if(iEndsWith(path, ".bin")){
+					// Point cloud: Skye fast-path binary (16 bytes/point) → SNPoints.
+					auto points = BINPointCloudLoader::load(path);
+					if(points){
+						shared_ptr<SNPoints> node = make_shared<SNPoints>(points->name, points);
+						editor->scene.world->children.push_back(node);
+						editor->setSelectedNode(node.get());
+						Runtime::controls->focus(points->min, points->max, 1.0f);
+					}
 				}else if(fs::is_directory(path)){
 
 					bool hasSceneJson = fs::exists(path + "/scene.json");
