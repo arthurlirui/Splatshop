@@ -543,14 +543,12 @@ def keyboard_key(req: M.KeyRequest):
 @app.post("/keyboard/press", dependencies=[Depends(_check_token)])
 def keyboard_press(req: M.KeyPressRequest):
     """Press then release a key, sleeping between the two events."""
-    splat_client.request("keyboard.key",
-                         {"key": req.key, "action": "press", "mods": req.mods or 0})
+    # Both the press and release calls go through the same error path so the
+    # endpoint returns a consistent HTTP status (502/503) regardless of which
+    # half fails, instead of an unhandled 500 on the press.
+    _call("keyboard.key", {"key": req.key, "action": "press", "mods": req.mods or 0})
     time.sleep(max(0.0, (req.duration_ms or 0) / 1000.0))
-    try:
-        return splat_client.request("keyboard.key",
-                                    {"key": req.key, "action": "release", "mods": req.mods or 0})
-    except (splat_client.BridgeError, splat_client.BridgeUnavailable) as e:
-        raise _bridge_error_to_http(e) from e
+    return _call("keyboard.key", {"key": req.key, "action": "release", "mods": req.mods or 0})
 
 
 @app.post("/keyboard/sequence", dependencies=[Depends(_check_token)])

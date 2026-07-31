@@ -9,9 +9,12 @@ Wire conventions (also enforced server-side, see docs/remote_api.md):
 
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+# GLFW modifier bitmask: shift=1, ctrl=2, alt=4, super=8 (max 15).
+MODS_MAX = 15
 
 MouseButton = Literal["left", "right", "middle"]
 KeyAction = Literal["press", "release", "repeat"]
@@ -78,7 +81,7 @@ class MouseMoveRequest(BaseModel):
 class MouseButtonRequest(BaseModel):
     button: MouseButton
     action: KeyAction
-    mods: Optional[int] = 0
+    mods: Optional[int] = Field(0, ge=0, le=MODS_MAX)
 
 
 class MouseScrollRequest(BaseModel):
@@ -92,9 +95,19 @@ class MouseEventRequest(BaseModel):
     y: Optional[float] = None
     button: Optional[MouseButton] = None
     action: Optional[KeyAction] = None
-    mods: Optional[int] = 0
+    mods: Optional[int] = Field(0, ge=0, le=MODS_MAX)
     scroll_dx: Optional[float] = None
     scroll_dy: Optional[float] = None
+
+    @model_validator(mode="after")
+    def _check_button_action_pair(self):
+        # The C++ bridge only injects a button event when BOTH button and action
+        # are present; silently skipping one without the other would mislead the
+        # client into thinking the click took effect. Require them together.
+        if (self.button is None) != (self.action is None):
+            raise ValueError(
+                "button and action must be provided together (both or neither)")
+        return self
 
 
 # --------------------------------------------------------------------------- #
@@ -103,16 +116,16 @@ class MouseEventRequest(BaseModel):
 class KeyRequest(BaseModel):
     """Inject a single key event. ``key`` is a GLFW key name (e.g. "W", "SPACE")
     or a numeric GLFW key code. ``mods`` is a bitmask (shift=1, ctrl=2, alt=4, super=8)."""
-    key: str
+    key: Union[int, str]
     action: KeyAction
-    mods: Optional[int] = 0
+    mods: Optional[int] = Field(0, ge=0, le=MODS_MAX)
 
 
 class KeyPressRequest(BaseModel):
     """Convenience: press a key, hold for ``duration_ms``, then release."""
-    key: str
+    key: Union[int, str]
     duration_ms: Optional[int] = 50
-    mods: Optional[int] = 0
+    mods: Optional[int] = Field(0, ge=0, le=MODS_MAX)
 
 
 class KeySequenceRequest(BaseModel):

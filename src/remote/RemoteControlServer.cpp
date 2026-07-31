@@ -292,7 +292,7 @@ static json cmd_mouse_button(const json& a) {
 	int btn = resolveButton(a["button"].get<string>());
 	int act = resolveAction(a["action"].get<string>());
 	if(btn < 0 || act < 0) throw runtime_error("invalid button/action");
-	int mods = a.value("mods", 0);
+	int mods = a.value("mods", 0) & 0xF; // GLFW modifier bitmask (shift/ctrl/alt/super)
 	if(act == 1)      Runtime::mouseButtons |= (1 << btn);
 	else if(act == 0) Runtime::mouseButtons &= ~(1 << btn);
 	Runtime::controls->onMouseButton(btn, act, mods);
@@ -326,7 +326,7 @@ static json cmd_mouse_event(const json& a) {
 		int btn = resolveButton(a["button"].get<string>());
 		int act = resolveAction(a["action"].get<string>());
 		if(btn < 0 || act < 0) throw runtime_error("invalid button/action");
-		int mods = a.value("mods", 0);
+		int mods = a.value("mods", 0) & 0xF; // GLFW modifier bitmask (shift/ctrl/alt/super)
 		if(act == 1)      Runtime::mouseButtons |= (1 << btn);
 		else if(act == 0) Runtime::mouseButtons &= ~(1 << btn);
 		Runtime::controls->onMouseButton(btn, act, mods);
@@ -353,7 +353,7 @@ static json cmd_keyboard_key(const json& a) {
 	if(key < 0) throw runtime_error("unknown key");
 	int act = resolveAction(a["action"].get<string>());
 	if(act < 0) throw runtime_error("invalid action");
-	int mods = a.value("mods", 0);
+	int mods = a.value("mods", 0) & 0xF; // GLFW modifier bitmask (shift/ctrl/alt/super)
 	if(key >= 0 && key < (int)Runtime::keyStates.size()) Runtime::keyStates[key] = act;
 	Runtime::mods = mods;
 	Runtime::frame_keys.push_back(key);
