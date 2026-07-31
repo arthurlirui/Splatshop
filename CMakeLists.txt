@@ -8,6 +8,7 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 # add_subdirectory(./libs/openvr-master)
 
 include(cmake/common.cmake)
+include(cmake/libtorch.cmake)   # adds ADD_LIBTORCH(target) function
 
 ##############################################
 ## SUBPROJECT: Splat Editor
@@ -57,8 +58,9 @@ target_include_directories(${TARGET_NAME} PRIVATE
 #enable_language(CUDA)
 
 # add some third-party libraries
-ADD_CUDA(${TARGET_NAME})
-ADD_OPENGL(${TARGET_NAME})
+	ADD_CUDA(${TARGET_NAME})
+	ADD_LIBTORCH(${TARGET_NAME})   # 4DGS support (optional; silently skips if not found)
+	ADD_OPENGL(${TARGET_NAME})
 ADD_GLM(${TARGET_NAME})
 ADD_IMGUI(${TARGET_NAME})
 ADD_IMPLOT(${TARGET_NAME})

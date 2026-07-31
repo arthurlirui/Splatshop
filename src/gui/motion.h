@@ -7,6 +7,7 @@
 #include "../motion/RiggedHumanController.h"
 #include "../motion/ProceduralRigSource.h"
 #include "../scene/SNRiggedSplats.h"
+#include "../scene/SN4DGSSplats.h"
 
 using namespace motion;
 
@@ -160,9 +161,70 @@ void SplatEditor::makeMotionGUI(){
 			}
 		}
 
-		ImGui::Separator();
+			ImGui::Separator();
 
-		// --- Human rig controls ------------------------------------------
+			// --- 4DGS Dynamic Scene Player --------------------------------
+			if(ImGui::CollapsingHeader("4DGS Dynamic Scene", ImGuiTreeNodeFlags_DefaultOpen)){
+				// Check if any SN4DGSSplats nodes exist in the scene
+				bool has4DGS = false;
+				size_t num4DGS = 0;
+				scene.forEach<SN4DGSSplats>([&](SN4DGSSplats*) {
+					has4DGS = true;
+					num4DGS++;
+				});
+
+				if(!has4DGS){
+					ImGui::TextDisabled("No 4DGS nodes in the scene.");
+					ImGui::TextDisabled("Import a 4DGS model (canonical.ply + deformation_model.pt).");
+				}else{
+					ImGui::Text("4DGS nodes: %zu", num4DGS);
+
+					auto& tl = editor->timeline;
+
+					// Playback controls
+					if(ImGui::Button(tl.playing ? "Pause##4dgs" : "Play##4dgs")){
+						tl.playing = !tl.playing;
+					}
+					ImGui::SameLine();
+					if(ImGui::Button("Stop##4dgs")){
+						tl.playing = false;
+						tl.playhead = 0.0;
+					}
+
+					// Time slider (normalized 0.0 to 1.0)
+					float ph = static_cast<float>(tl.playhead);
+					if(ImGui::SliderFloat("time##4dgs", &ph, 0.0f, 1.0f, "t=%.3f")){
+						tl.playhead = static_cast<double>(ph);
+					}
+
+					// Playback speed
+					static float speed = 1.0f;
+					ImGui::SliderFloat("speed##4dgs", &speed, 0.1f, 4.0f, "%.1fx");
+
+					// Info
+					ImGui::TextDisabled("Cycle: 0.0 → 1.0 → 0.0 (bounce loop)");
+
+					// Enable/disable deformation on selected 4DGS node
+					shared_ptr<SceneNode> sel = editor->getSelectedNode();
+					SN4DGSSplats* node4dgs = sel ? dynamic_cast<SN4DGSSplats*>(sel.get()) : nullptr;
+					if(node4dgs){
+						ImGui::Separator();
+						ImGui::Text("Selected: %s", node4dgs->name.c_str());
+						bool enabled = node4dgs->deformationEnabled;
+						if(ImGui::Checkbox("Deformation active", &enabled)){
+							node4dgs->deformationEnabled = enabled;
+							if(enabled) node4dgs->needsRecompute.store(true);
+						}
+						if(ImGui::Button("Force recompute##4dgsforce")){
+							node4dgs->needsRecompute.store(true);
+						}
+					}
+				}
+			}
+
+			ImGui::Separator();
+
+			// --- Human rig controls ------------------------------------------
 		// If the selected node is a SNRiggedSplats, expose per-joint local pose
 		// sliders and ARKit 52 blendshape sliders. Otherwise offer to convert a
 		// plain SNSplats selection into a procedural test rig.

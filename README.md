@@ -23,9 +23,10 @@ A precompiled windows binary is available [here](http://users.cg.tuwien.ac.at/ms
 	<li> No pip or conda issues! (no Python)
 	<li> CUDA Driver API - Can edit and hot-reload CUDA code like shaders.
 	<li> Includes support for <a href="https://github.com/nerficg-project/HTGS">perspective-correct gaussians</a>. (Splat models need to be trained with respective method)
-	<li> Object motion control and skeletal skinning (see <code>src/motion/</code>).
-	<li> HTTP-based remote control API: camera / mouse / keyboard / rigid-body motion / Gaussian splats creation, loading, deletion and coloring, drivable from local Python programs or remote WebRTC receivers (see <a href="#remote-control-api">Remote Control API</a>).
-</ul>
+		<li> Object motion control and skeletal skinning (see <code>src/motion/</code>).
+		<li> HTTP-based remote control API: camera / mouse / keyboard / rigid-body motion / Gaussian splats creation, loading, deletion and coloring, drivable from local Python programs or remote WebRTC receivers (see <a href="#remote-control-api">Remote Control API</a>).
+		<li> <b>4D Gaussian Splatting (4DGS) dynamic scene rendering</b> — load and play back dynamic 4DGS scenes trained with <a href="https://github.com/hustvl/4DGaussians">hustvl/4DGaussians</a>. Includes deformation via HexPlane + MLP, timeline controls, and real-time editing of canonical Gaussians (see <a href="#4dgs-dynamic-scenes">4DGS Dynamic Scenes</a>).
+	</ul>
 
 ### Known Issues
 <ul>
@@ -45,10 +46,11 @@ A precompiled windows binary is available [here](http://users.cg.tuwien.ac.at/ms
 <summary>Windows</summary>
 
 Dependencies: 
-* CUDA 12.4 or later
+* CUDA 12.4 or later (CUDA 13.x also verified)
 * Visual Studio 2022 (version 17.10.3 or later)
 * CMake 3.22 or later
-* RTX 4070 or better recommended (RTX 5090 also verified).
+* RTX 4070 or better recommended (RTX 5090(D) also verified).
+* For 4DGS dynamic scenes: LibTorch 2.6+ (see <a href="#4dgs-dynamic-scenes">4DGS section</a>)
 
 Generate the Visual Studio solution and build the Release binary from the command line:
 
@@ -98,7 +100,112 @@ export LD_LIBRARY_PATH=~/gcc-14.1.0/x86_64-linux-gnu/libstdc++-v3/src/.libs:$LD_
 // run from workspace root
 ./build/SplatEditor
 ```
-</details>
+	</details>
+
+## 4DGS Dynamic Scenes
+
+Splatshop supports loading and interactive playback of 4D Gaussian Splatting (4DGS) dynamic scenes trained by [hustvl/4DGaussians](https://github.com/hustvl/4DGaussians). The 4DGS approach represents a dynamic scene as:
+- **Canonical Gaussians** (a standard `.ply` file, the rest-pose 3D Gaussians)
+- **Deformation field** (a HexPlane + MLP that displaces canonical Gaussians per timestep)
+
+### Dependencies
+
+**LibTorch 2.0+ (C++ distribution)**
+
+Download the LibTorch C++ distribution from [pytorch.org](https://pytorch.org/get-started/locally/). Select: **LibTorch**, **C++**, match your GPU.
+
+| GPU | Recommended LibTorch |
+|-----|---------------------|
+| RTX 30/40 series | [LibTorch CUDA 12.4](https://download.pytorch.org/libtorch/cu124/libtorch-win-shared-with-deps-latest.zip) |
+| **RTX 5090 (Blackwell)** | [LibTorch CUDA 12.8](https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.6.0%2Bcu128.zip) |
+
+> **Note**: LibTorch bundles its own CUDA runtime libraries. Your system CUDA version (e.g. 13.2) only needs to be ≥ the LibTorch CUDA version at the driver level — full backward compatibility is guaranteed. Splatshop itself compiles against your system CUDA toolkit independently.
+
+	Set the `Torch_DIR` CMake variable (or `LIBTORCH_PATH` environment variable):
+
+	```bash
+	# Windows
+	cmake -B build -S . -DTorch_DIR="C:/libtorch/share/cmake/Torch"
+
+	# Linux
+	export LIBTORCH_PATH=/path/to/libtorch
+	cmake -B build -S .
+	```
+
+	### Compatibility
+
+	LibTorch bundles its own CUDA runtime libraries — it does **not** depend on your system CUDA Toolkit. It only requires the GPU driver to be ≥ the LibTorch CUDA version.
+
+	| System CUDA | GPU | LibTorch to use |
+	|---|---|---|
+	| 12.4 — 12.7 | RTX 30/40 series | cu124 ✅ |
+	| 12.8+ | RTX 50 series (Blackwell) | cu128 ✅ |
+	| 13.x | RTX 5090(D) | cu128 ✅ (driver backward-compatible) |
+
+	### Quick Setup (RTX 5090D + CUDA 13.2)
+
+	```bash
+	# Step 1: Download LibTorch cu128
+	curl -L -o libtorch.zip ^
+	  "https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.6.0%%2Bcu128.zip"
+
+	# Step 2: Extract to C:\libtorch (or anywhere)
+	tar -xf libtorch.zip -C C:\
+
+	# Step 3: Configure & build Splatshop
+	cmake -B build -S . -DTorch_DIR="C:/libtorch/share/cmake/Torch"
+	cmake --build build --config Release
+	```
+
+If LibTorch is not found, 4DGS is silently disabled — the rest of Splatshop builds normally.
+
+### Exporting a 4DGS Model
+
+**Step 1**: Train a 4DGS model using the [hustvl/4DGaussians](https://github.com/hustvl/4DGaussians) codebase:
+
+```bash
+# In the 4DGaussians repo
+python train.py -s data/dnerf/lego --port 6009 --expname "dnerf/lego" --configs arguments/dnerf/lego.py
+```
+
+**Step 2**: Convert the training checkpoint to a TorchScript bundle:
+
+```bash
+# In the Splatshop repo
+python tools/export_4dgs_torchscript.py \
+    --checkpoint <4DGaussians>/output/dnerf/lego/chkpnt30000.pth \
+    --ply <4DGaussians>/output/dnerf/lego/point_cloud/iteration_30000/point_cloud.ply \
+    --out lego_4dgs
+```
+
+This produces:
+```
+lego_4dgs/
+  canonical.ply          # Canonical (rest-pose) 3D Gaussians
+  deformation_model.pt   # TorchScript deformation module
+  config.json            # Metadata
+```
+
+### Loading & Playback
+
+1. Launch Splatshop
+2. Drag `canonical.ply` into the editor window → loads the rest pose
+3. In the **Motion** panel (Toolbar → Motion), go to **4DGS Dynamic Scene**
+4. Click **Import model** and select `deformation_model.pt`
+5. Use the play/pause button or scrub the timeline to animate
+
+The timeline cycles from t=0.0 to t=1.0 and back (bounce loop). Adjust **speed** to control playback rate.
+
+### Editing
+
+- **Pause** at any frame to inspect the dynamic scene
+- **Select/delete/paint** canonical Gaussians — edits apply to the rest pose
+- All frames automatically reflect the edit after the next deformation pass
+- Toggle **Deformation active** to temporarily view/compare the canonical pose
+
+### Architecture Notes
+
+The integration uses LibTorch's CUDA backend; deformed tensors share the same CUDA context as Splatshop's own CUDA buffers. The deformation is computed once per frame (cached when time hasn't changed), producing deformed positions/scales/rotations that are fed into the existing 3DGS tile-based rasterizer unchanged. No new CUDA kernels are needed for the deformation itself.
 
 ## Remote Control API
 

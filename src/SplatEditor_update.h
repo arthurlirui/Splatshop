@@ -22,6 +22,31 @@ void SplatEditor::update(){
 		timeline.update(scene, motionDt);
 	}
 
+	// 4DGS auto-playback: when no timeline tracks are loaded but the scene
+	// contains SN4DGSSplats nodes, auto-advance the internal time so that
+	// the deformation animates continuously (cycling 0.0 → 1.0 → 0.0...).
+	// The deformation itself is dispatched in draw() just before staging.
+	{
+		static double last4DGSTime = now();
+		double curTime = now();
+		double dt = curTime - last4DGSTime;
+		last4DGSTime = curTime;
+
+		bool has4DGS = false;
+		scene.forEach<SN4DGSSplats>([&](SN4DGSSplats*) { has4DGS = true; });
+
+		if (has4DGS && timeline.tracks.empty() && timeline.playing) {
+			// Auto-cycle: bounce 0→1→0, loop duration ~4 seconds
+			constexpr double cycleDuration = 4.0;
+			static double autoTime = 0.0;
+			static int direction = 1;
+			autoTime += direction * dt / cycleDuration;
+			if (autoTime >= 1.0) { autoTime = 1.0; direction = -1; }
+			if (autoTime <= 0.0) { autoTime = 0.0; direction = 1; }
+			timeline.playhead = autoTime;
+		}
+	}
+
 	// Motion control: accumulate rigged-splat joint poses into skinning matrices
 	// and upload to device. The actual skinning kernel is dispatched in draw(),
 	// right before the per-node render launch, so deformed splats are ready for

@@ -1,5 +1,6 @@
 #include "gui/ImguiPage.h"
 #include "gui/guivr.h"
+#include "scene/SN4DGSSplats.h"
 
 struct ConcurrentTarget{
 	RenderTarget target;
@@ -1358,6 +1359,32 @@ void SplatEditor::draw(Scene* scene, vector<RenderTarget> targets){
 	// per-node staging launch, so the deformed position/scale/quaternion are
 	// ready in dmng.data for the render kernels. No-op for non-rigged scenes.
 	rigController.dispatchSkinning(*scene);
+
+	// 4DGS dynamic scene: deform canonical Gaussians via HexPlane + MLP.
+	// Runs the TorchScript deformation model for each SN4DGSSplats node,
+	// writing the time-dependent position/scale/rotation/opacity into
+	// deformBuffer. The staging step below routes to these deformed buffers
+	// when the node is a SN4DGSSplats.
+	int64_t num4dgsDispatched = 0;
+	std::vector<SN4DGSSplats*> deformedNodes4DGS;
+	scene->forEach<SN4DGSSplats>([&](SN4DGSSplats* node) {
+		if (!node->visible) return;
+		if (node->dmng.data.count == 0) return;
+		float t = timeline.playhead > 0.0
+			? float(timeline.playhead / (timeline.duration > 0.0 ? timeline.duration : 1.0))
+			: 0.0f;
+		node->deform(t, mainstream);
+		node->swapToDeformed();
+		deformedNodes4DGS.push_back(node);
+		num4dgsDispatched++;
+	});
+
+	// ... (rest of the draw function remains the same) ...
+
+	// After all splat rendering is complete, restore canonical pointers
+	for (auto* node : deformedNodes4DGS) {
+		node->swapToCanonical();
+	}
 
 	// Stuff that only needs to be done once for all targets
 	vector<SNPoints*> nodes;

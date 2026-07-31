@@ -13,6 +13,8 @@
 #include "./scene/SceneNode.h"
 #include "./scene/Scene.h"
 #include "./scene/SNSplats.h"
+#include "./scene/SNRiggedSplats.h"
+#include "./scene/SN4DGSSplats.h"
 #include "./scene/ImguiNode.h"
 #include "./scene/SNPoints.h"
 #include "./scene/SNTriangles.h"
