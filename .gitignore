@@ -122,3 +122,8 @@ splatmodels_statue2/
 /src/**
 !/src/**/*.h
 !/include/**/*.h
+libs/libtorch-win-shared-with-deps-2.6.0+cu124.zip
+libs/OrbbecSDK_v2.9.3_202607152322_2f6561c_win_x64.zip
+/Log
+/Log
+Log/OrbbecSDK.log.txt
