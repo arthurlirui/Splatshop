@@ -523,13 +523,14 @@ void SplatEditor::makeOrbbecPreviewGUI() {
 		}
 
 		// ================================================================
-		// Point cloud statistics (3D rendering is in the main viewport via SNOrbbec)
+		// Point cloud statistics (3D rendering available via the dedicated
+		// "Orbbec Point Cloud" panel, toggled from the "PC View" menu button)
 		// ================================================================
 		ImGui::Separator();
 		if (cap->isPointCloudEnabled()) {
 			auto pc = cap->getLatestPointCloud();
 			if (pc && pc->colorData && pc->colorWidth > 0) {
-				ImGui::Text("Point cloud: %d points  (rendered in main viewport)",
+				ImGui::Text("Point cloud: %d points  (open \"PC View\" for the 3D window)",
 				            pc->colorWidth);
 			} else {
 				ImGui::TextDisabled("point cloud enabled, waiting for first cloud...");

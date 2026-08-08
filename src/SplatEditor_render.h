@@ -451,9 +451,11 @@ void SplatEditor::render(){
 
 				// Render the cloud: depth pass, color pass (with the live
 				// color correction so the panel matches the main viewport),
-				// then normalize into pcTarget.framebuffer. The point's own
-				// transform is identity for SNOrbbec, so use pd.transform.
-				pd.transform = node->transform_global;
+				// then normalize into pcTarget.framebuffer. SNOrbbec's
+				// transform is identity, so pd.transform (set once at
+				// construction) is already correct - no per-frame assignment
+				// here, to avoid an implicit ordering dependency on the main
+				// draw() path that also reads pd.transform.
 				float pointSize = settings.orbbecPCPointSize;
 
 				prog_points->launch("kernel_hqs_depth",

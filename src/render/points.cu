@@ -335,9 +335,8 @@ void kernel_hqs_depth(
 
 	if(ndc.w < 0.0f) return;
 
-	// float pointSize = 0.5f;
-	pointSize = 0.0f;
-
+	// Host-controlled splat radius (in pixels). The main HQS path passes
+	// 0.5f; the Orbbec Point Cloud panel passes settings.orbbecPCPointSize.
 	for(float dx = -pointSize; dx <= pointSize; dx += 1.0f)
 	for(float dy = -pointSize; dy <= pointSize; dy += 1.0f)
 	{
@@ -412,9 +411,7 @@ void kernel_hqs_color(
 
 	if(ndc.w < 0.0f) return;
 
-	// float size = 0.5f;
-	pointSize = 0.0f;
-
+	// Host-controlled splat radius (see kernel_hqs_depth above).
 	for(float dx = -pointSize; dx <= pointSize; dx += 1.0f)
 	for(float dy = -pointSize; dy <= pointSize; dy += 1.0f)
 	{

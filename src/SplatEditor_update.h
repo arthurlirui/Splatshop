@@ -288,6 +288,21 @@ void SplatEditor::update(){
 		pd.count = (uint32_t)numPoints;
 		pd.numUploaded = (uint32_t)numPoints;
 
+		// Recompute the device-side bounding box so consumers that frame the
+		// cloud (e.g. the Orbbec Point Cloud panel's auto-fit orbit camera
+		// and the GUI status line) see valid pd.min/pd.max each frame. The
+		// general SNPoints path computes this elsewhere, but the recurring
+		// Orbbec upload bypasses that, so do it here.
+		//
+		// The uploads above run on `mainstream` (non-blocking), while
+		// updateBoundingBox launches its kernel on the default stream (0) and
+		// reads back with a synchronous cuMemcpyDtoH. Synchronize `mainstream`
+		// first so the position data is resident before the bounding-box
+		// kernel reads it (same cross-stream pattern documented at the remesh
+		// site in SplatEditor.cpp).
+		cuStreamSynchronize(mainstream);
+		updateBoundingBox(pd);
+
 		node->frameReady.store(false);
 	});
 #endif
