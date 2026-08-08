@@ -1,0 +1,1429 @@
+
+================================================================================
+                    Splatshop 技术报告
+                    版本日期: 2026-08-07
+================================================================================
+
+  Paper: "Splatshop: Efficiently Editing Large Gaussian Splat Models"
+  Markus Schütz, Christoph Peters, Florian Hahlbohm, Elmar Eisemann,
+  Marcus Magnor, Michael Wimmer — Computer Graphics Forum 2025
+
+================================================================================
+                              目  录
+================================================================================
+
+  第1章  项目概述
+  第2章  系统架构总览
+  第3章  新增功能详解 ★
+    3.1  渐进式点云渲染器
+    3.2  4DGS 动态场景支持
+    3.3  远程控制 API
+    3.4  运动控制与骨骼蒙皮
+    3.5  VR 远程观看
+    3.6  OrbbecSDK 集成
+    3.7  场景 Splats CRUD API
+  第4章  构建系统
+  第5章  已知限制与未来方向
+  附录
+
+================================================================================
+
+
+第1章  项目概述
+================================================================================
+
+1.1 项目定位
+────────────────────────────────────────────────────────────────
+
+Splatshop 是一个高效的大型 3D Gaussian Splatting (3DGS) 模型编辑器，旨在对
+高斯泼溅模型进行编辑、清理、组装和场景创作。该项目发表于 Computer Graphics
+Forum 2025，目前处于学术原型 (Alpha) 阶段。
+
+1.2 核心能力指标
+────────────────────────────────────────────────────────────────
+
+  • 桌面端: 支持最多 1 亿个 splats
+  • VR 模式 (RTX 4090): 支持约 1000 万个 splats
+  • 纯 C++/CUDA 实现，无需 Python 运行环境
+  • CUDA Driver API: 内核代码可像着色器一样热编辑和热重载
+
+1.3 技术栈概览
+────────────────────────────────────────────────────────────────
+
+  | 层级       | 技术                              |
+  |------------|-----------------------------------|
+  | 语言       | C++23, CUDA (NVRTC JIT 编译)      |
+  | 图形 API   | OpenGL 4.5 (桌面) + OpenVR (VR)   |
+  | 深度学习   | LibTorch 2.6+ (4DGS 变形网络)     |
+  | GUI        | Dear ImGui + ImPlot + ImGuizmo    |
+  | 数学库     | GLM, 自研四元数运算                |
+  | 构建系统   | CMake 3.22+                       |
+  | 平台       | Windows (VS 2022) / Linux (GCC 14)|
+
+1.4 已实现功能
+────────────────────────────────────────────────────────────────
+
+  • 撤销/重做 (Undo/Redo)
+  • VR 查看和编辑 (OpenVR/SteamVR)
+  • 笔刷/球形/矩形选择，笔刷/Del 删除
+  • 选取节点或 splats 的平移/旋转/缩放
+  • 绘制/上色 (Painting)
+  • 透视校正高斯 (perspective-correct gaussians)
+  • 3 点对齐工具
+  • 资产库 (Asset Library)
+  • 图层管理 (复制 Ctrl+D, 合并 Ctrl+E)
+
+  ★ 以下为近期 (2025-2026) 新增功能:
+  • 渐进式点云渲染器 (Skye 算法实现)
+  • 4DGS 动态场景加载与播放 (HexPlane + MLP 变形)
+  • 远程控制 HTTP API (FastAPI + JSON-RPC)
+  • 对象运动控制 + 骨骼蒙皮 (LBS + 52 ARKit blendshape)
+  • VR 远程观看 (WebXR 客户端 + NVENC 视频流)
+  • OrbbecSDK RGBD 相机集成
+  • 场景 Splats 创建/加载/删除/着色 API
+
+1.5 示例数据集
+────────────────────────────────────────────────────────────────
+
+  http://users.cg.tuwien.ac.at/mschuetz/permanent/splatmodels.zip
+
+  包含一个花园场景 (garden)，源自 Inria 3DGS 的预训练模型，原始数据来自
+  Mip-NeRF 360: Unbounded Anti-Aliased Neural Radiance Fields。
+
+
+第2章  系统架构总览
+================================================================================
+
+2.1 SplatEditor 主类结构
+────────────────────────────────────────────────────────────────
+
+  SplatEditor 是一个 C++ struct (约 528 行)，作为应用程序的中央控制枢纽，
+  通过静态单例 SplatEditor::instance 访问。核心成员如下:
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  SplatEditor                                                │
+  │  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐ │
+  │  │ Scene scene   │  │ CUDA Programs│  │ OpenVRHelper* ovr │ │
+  │  │ (场景图)      │  │ (7 个模块)   │  │ (VR 集成)         │ │
+  │  └──────────────┘  └──────────────┘  └───────────────────┘ │
+  │  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐ │
+  │  │ 历史记录      │  │ 资产库       │  │ 设置 + 状态      │ │
+  │  │ (undo stack)  │  │ (AssetLib)   │  │ (settings/state)  │ │
+  │  └──────────────┘  └──────────────┘  └───────────────────┘ │
+  │  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐ │
+  │  │ Timeline     │  │ RiggedCtrl   │  │ RemoteStereo     │ │
+  │  │ (关键帧)     │  │ (蒙皮动画)   │  │ (远程VR状态)     │ │
+  │  └──────────────┘  └──────────────┘  └───────────────────┘ │
+  └─────────────────────────────────────────────────────────────┘
+
+  7 个 CUDA 可执行程序模块 (CudaModularProgram):
+    • prog_gaussians_rendering  — 3DGS 泼溅渲染内核
+    • prog_gaussians_editing    — 笔刷编辑内核
+    • prog_points               — HQS 点云渲染器
+    • prog_progressive_points   — 渐进式点云渲染器 ★
+    • prog_triangles            — 三角形网格渲染
+    • prog_lines                — 线段渲染
+    • prog_helpers              — 辅助/调试内核
+    • prog_skinning             — 骨骼蒙皮内核 ★
+
+2.2 渲染管线 (draw 流程)
+────────────────────────────────────────────────────────────────
+
+  SplatEditor::draw() 每帧执行的渲染步骤:
+
+  Step 0: 蒙皮调度
+    rigController.dispatchSkinning(scene) — 如有 SNRiggedSplats 节点
+
+  Step 1: 4DGS 变形 ★
+    收集所有 SN4DGSSplats 节点
+    → node->deform(t, mainstream)    // 推入 LibTorch 正向传播
+    → node->swapToDeformed()          // 交换指针到变形输出缓冲
+    → 记录 deformEvent 供后续流等待
+
+  Step 2: 收集可渲染节点
+    scene.forEach<SNPoints>, scene.forEach<SNTriangles>
+
+  Step 3: 逐目标并行渲染 (每个 RenderTarget 有独立 CUDA 流)
+    3a. 等待 deformEvent (如有 4DGS 变形)
+    3b. 清空帧缓冲
+    3c. 点云渲染 (分流):
+        • HQS 路径: 逐点原子深度/颜色写入
+        • Progressive 路径 ★: 4 阶段流水线
+    3d. 3DGS 瓦片渲染:
+        预过滤 → 排序 → 瓦片分配 → 正向渲染 → EDL 后处理
+    3e. 三角形渲染
+
+  Step 4: 恢复 4DGS 规范态
+    node->swapToCanonical() — 渲染完成后恢复原始指针
+
+  ConcurrentTarget 结构 (每渲染目标):
+    • 独立 CUDA 主流/副流
+    • 虚拟内存: 深度缓冲, 颜色缓冲, 瓦片列表, splat 索引,
+      暂存数据, 排序缓冲, 瓦片片段计数, 几何边界
+    • 主机可读计数器: numVisibleSplats, numFragments
+
+  ProgressiveTarget 结构 (每渲染目标) ★:
+    • indexImage       — 每像素 uint32 (0xFFFFFFFF = 空)
+    • reprojectBuffer  — ProgressiveVertex[] 局部空间可见点
+    • indirect         — ProgressiveIndirectCommand 原子计数
+    • 固定主机镜像     — 零拷贝读取间接计数
+    • CUDA 事件         — evFillStart/evFillEnd (自适应预算计时)
+    • pointsPerMs      — 吞吐量估算
+
+2.3 更新管线 (update 流程)
+────────────────────────────────────────────────────────────────
+
+  SplatEditor::update() 每帧执行的步骤:
+
+  1. cuCtxSynchronize()          — 同步 CUDA 上下文
+  2. 更新窗口标题 (FPS 显示)
+  3. TWEEN::update()             — Tween 动画系统推进
+  4. timeline.update(scene, dt)  — 关键帧时间线 ★
+  5. 4DGS 自动回放 ★            — 如无时间线但有 4DGS 节点
+  6. rigController.update(scene) — 骨骼蒙皮姿态更新 ★
+  7. ImGui 新帧
+  8. Runtime::timings.newFrame() — 重置滑动窗口计时
+  9. scene.updateTransformations() — 场景变换传播
+  10. 重置每帧计数器
+  11. 构建各内核的 CommonLaunchArgs
+  12. 零初始化设备状态计数器
+  13. 拖放预览位置更新
+  14. uploadSplats()             — 异步上传新加载的 splat 数据
+  15. uploadPoints()             — 异步上传点云数据 ★
+  16. Orbbec 实时点云上传 ★      — SNOrbbec 帧就绪标志
+  17. VR 姿态更新                — OpenVR HMD/控制器跟踪
+  18. 远程立体视图模式设置 ★     — 三种姿态空间
+  19. inputHandling()            — 桌面/VR 输入分发
+  20. 异步线段上传
+
+2.4 CUDA 模块化程序设计
+────────────────────────────────────────────────────────────────
+
+  文件名: include/CudaModularProgram.h
+
+  系统基于 NVRTC (编译) + nvJitLink (链接) 构建 JIT 编译流水线。
+
+  CudaModule (单个 .cu 源文件):
+    • 路径/名称, LTOIR 数据
+    • compile() 方法:
+      - 读取源文件
+      - 自动检测 GPU 计算能力
+      - 编译选项: --use_fast_math, --extra-device-vectorization,
+        -lineinfo, --std=c++20, --relocatable-device-code=true,
+        --dlink-time-opt, --split-compile=0 (全核)
+      - 生成 LTOIR 中间表示
+
+  CudaModularProgram (完整链接程序):
+    • 管理多个 CudaModule
+    • link() 方法:
+      - nvJitLink: -dlto, -arch=sm_XY, -O3
+      - 添加所有模块的 LTOIR 数据
+      - cuModuleLoadData 加载最终 cubin
+      - 枚举所有内核入 kernels 映射 (unordered_map<string,CUfunction>)
+    • 启动 API:
+      - launch(name, args, count) — 自动计算网格尺寸
+      - launch(name, args, settings) — 显式网格/块 + 可选流 + 计时
+      - launchCooperative(name, args, ...) — 协作组
+      - fromCubin(cubin, size) — 从预编译 cubin 加载
+    • 热重载: monitorFile 监视源文件变化 → 自动重编译 + 重链接
+    • 计时系统: EventPool 回收 CUevent, 异步解析内核用时
+
+2.5 场景图节点层次
+────────────────────────────────────────────────────────────────
+
+  SceneNode (基类)
+  ├── SNSplats             — 3DGS 高斯泼溅 (核心图元)
+  │   ├── SNRiggedSplats   — 骨骼蒙皮高斯 ★
+  │   └── SN4DGSSplats     — 4DGS 动态高斯 ★
+  ├── SNPoints             — 点云
+  │   └── SNOrbbec         — Orbbec 实时 RGBD 点云 ★
+  ├── SNTriangles          — 三角形网格 (VR 控制器模型等)
+  ├── SNLines              — 线段 (调试绘制)
+  └── ImguiNode            — VR GUI 覆盖面板
+
+  SNSplats 包装 GaussianData 结构:
+    • position[]   — vec3 (float3)
+    • scale[]      — vec3
+    • quaternion[] — vec4
+    • color[]      — uint16 (RGBA 打包)
+    • SH[]         — 球谐系数 (当前未使用)
+    • flags[]      — 每 splat 标志位
+
+  SNPoints 包装 PointData 结构:
+    • position[]   — vec3
+    • color[]      — uint32 (RGBA 打包)
+
+2.6 全局源文件发现机制
+────────────────────────────────────────────────────────────────
+
+  CMakeLists.txt 使用 file(GLOB ... CONFIGURE_DEPENDS) 自动发现 12 个子目录
+  下的所有源文件。添加或删除 .cu/.cpp/.h 文件不需要修改 CMakeLists.txt，
+  下次 cmake 配置时自动生效。
+
+  被 Glob 的目录:
+    src/*.*
+    src/actions/*.*
+    src/GPUPrefixSums/*.*  src/GPUSorting/*.*
+    src/gui/*.*            src/motion/*.*       src/render/*.*
+    src/remote/*.*         src/scene/*.*         src/update/*.*
+    src/loader/*.*         src/writer/*.*        src/camera/*.*
+    include/*.*
+    src/win32/*.* (Windows) 或 src/unix/*.* (Linux)
+
+
+第3章  新增功能详解 ★
+================================================================================
+
+  ★ 标记功能为近期新增 (约 2025 年底至 2026 年第三季度)
+
+================================================================================
+3.1  渐进式点云渲染器 ★
+================================================================================
+
+3.1.1 理论基础
+────────────────────────────────────────────────────────────────
+
+  基于 Schütz et al. (2019): "Progressive Real-Time Rendering of One
+  Billion Points Without Hierarchical Acceleration Structures" (TU Wien)。
+  参考实现: Skye 项目 (E:\Code\Skye, OpenGL 4.5 + V8/JS)。
+  Splatshop 以 CUDA 重建全管线，复用现有的 (depth<<32)|color 帧缓冲约定。
+
+  核心技术: 素数同余置换 (prime-congruence permutation)
+  ──────────────────────────────────────────────────
+
+  性质: 对于任意素数 p ≡ 3 (mod 4)，映射 f(n) = n² mod p 是 [0, p) 上的
+  二次双射 (bijection)，且 f(f(n)) 同样为双射。
+
+  应用: 对点云中每个点索引 i，计算目标槽位:
+    slot = permuteI(permuteI(i, prime), prime)
+  其中 permuteI(n, p) = (n * n) % p (uint64 防溢出)。
+
+  结果: 在置换后的缓冲区中，从偏移 fillOffset 开始连续顺序绘制，相当于
+  对整个点云进行均匀随机采样。无需层次加速结构，每帧开销仅受填充预算限制。
+
+3.1.2 数据结构
+────────────────────────────────────────────────────────────────
+
+  ProgressivePointData (设备端 POD):
+    count, numBuffers, maxPointsPerBuffer = 134,000,000
+    position[8]  — vec3* 数组，每块缓冲区指针
+    color[8]     — uint32* 数组
+    prime        — uint64 置换素数
+    fillOffset   — uint32 实时填充游标 (环绕 [0, count))
+    ready        — bool (distribute 完成后置 true)
+
+  ProgressiveVertex (20 字节, 重投影缓冲条目):
+    {ux, uy, uz, color, index}
+    位置存储在局部空间，每帧重投影时重新应用节点的世界变换。
+
+  ProgressiveIndirectCommand (间接绘制命令):
+    {count, primCount, firstIndex, baseVertex, baseInstance}
+    与 Skye 的 5-uint 布局兼容，仅 count 被使用。
+
+  ProgressivePointCloud (主机端):
+    vm_position[8], vm_color[8]  — CudaVirtualMemory 块
+    init(numPoints): 计算素数 → 分配虚拟内存 → 物理提交
+    largestPrimeCongruent3mod4(n): Skye 的 previousPrimeCongruent3mod4 的 C++ 版本
+    限制: 最多 8 * 134M ≈ 10.7 亿点
+
+3.1.3 五阶段流水线
+────────────────────────────────────────────────────────────────
+
+  所有内核位于 src/render/progressive_points.cu
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ 加载时 (一次性)                                                  │
+  │ Stage 0: kernel_progressive_distribute                          │
+  │   每个规范态点 → 置换索引 → 写入分块缓冲区                        │
+  │   完成后 ProgressivePointData.ready = true                      │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ 每帧:                                                            │
+  │ Stage 1: kernel_progressive_clear_index                         │
+  │   将每像素索引图清零 (0xFFFFFFFF = "无点")                        │
+  │                                                                  │
+  │ Stage 2: kernel_progressive_reproject                           │
+  │   对上一帧 reprojectBuffer 中的每个可见点:                        │
+  │   重新应用当前世界变换 MVP 矩阵                                   │
+  │   → atomicMin 写入 framebuffer ((depth<<32)|color)              │
+  │   → 写入 indexImage[pixelID] (最前点)                           │
+  │                                                                  │
+  │ Stage 3: kernel_progressive_fill                                │
+  │   对预算数量个线程，读取置换缓冲中 (fillOffset+i)%count 位置的点  │
+  │   → 投影 → 写入 framebuffer + indexImage                        │
+  │   主机推进 fillOffset                                            │
+  │                                                                  │
+  │ Stage 4: kernel_progressive_reset_indirect (单线程)             │
+  │   清零 indirect->count                                           │
+  │                                                                  │
+  │ Stage 5: kernel_progressive_create_vbo                          │
+  │   对每个帧缓冲像素: 从 indexImage 读取全局点 ID                   │
+  │   → atomicAdd(&indirect->count, 1) 获取压缩槽位                  │
+  │   → 从渐进式云获取局部空间位置 + 颜色                            │
+  │   → 写入 reprojectBuffer[slot]                                  │
+  │   最终计数即为下一帧 indirect->count                             │
+  └─────────────────────────────────────────────────────────────────┘
+
+3.1.4 自适应帧预算
+────────────────────────────────────────────────────────────────
+
+  kernel_progressive_compute_fill:
+    • 输入: 重投影耗时 (ms, 来自 CUDA 事件), 填充耗时, 目标帧时间,
+            吞吐量估算 (points/ms)
+    • 计算: remaining = (targetMs - elapsedMs) * pointsPerMs
+    • 钳制: [minFill, numPoints]
+    • 自调节: 如重投影+固定填充便宜 → 本帧多花点; 如昂贵 → 少画点
+
+3.1.5 加载器
+────────────────────────────────────────────────────────────────
+
+  BINPointCloudLoader (src/loader/BINPointCloudLoader.h):
+    Skye 快速路径, .bin = 16 字节/点 {float x/y/z, uint8 r/g/b/a} LE
+    分离 jthread 流式加载, 500K 点/批
+    转换交叉格式到分离的 position/color 布局
+
+  PointCloudPlyLoader (src/loader/PointCloudPlyLoader.h):
+    通用点云 PLY (区别于 GSPlyLoader 的高斯泼溅 PLY)
+    通过 scale_0/rot_0/f_dc_0 属性检测高斯泼溅 PLY 并拒绝
+    支持 ASCII 和 binary_little_endian, uint8/uint16 颜色
+    防御式解析, 损坏行跳过
+
+3.1.6 GUI 面板
+────────────────────────────────────────────────────────────────
+
+  src/gui/pointcloud.h:
+    • 渲染器单选: HQS vs Progressive
+    • 渐进式控件: 填充预算滑块 (10K–30M), 点大小,
+      自适应预算复选框 + 目标帧时间, 重置按钮
+    • 每节点统计: 加载/上传点数, 包围盒, VRAM
+    • 渐进式统计: 置换缓冲信息 (点数/素数/块数/填充偏移/VRAM/就绪状态)
+    • "Load Point Cloud..." 对话框 (LAS/BIN/PLY)
+
+================================================================================
+3.2  4DGS 动态场景支持 ★
+================================================================================
+
+3.2.1 理论基础
+────────────────────────────────────────────────────────────────
+
+  Splatshop 支持 hustvl/4DGaussians 训练的 4D Gaussian Splatting 动态场景。
+
+  4DGS 将动态场景表示为两部分:
+    ① 规范态高斯 (canonical Gaussians): 标准 .ply 文件 (静止姿态的 3DGS)
+    ② 变形场 (deformation field): HexPlane 六平面网格 + MLP 多层感知机,
+       对每个时间步, 将规范态高斯位移到动态姿态
+
+  变形网络输入: 规范态 position, scale, quaternion, opacity + 时间 t
+  变形网络输出: 变形后 position, scale, rotation, [opacity]
+    (Splatshop 将 opacity 存储在 color 中, 不单独消费变形 opacity)
+
+3.2.2 场景节点: SN4DGSSplats
+────────────────────────────────────────────────────────────────
+
+  文件: src/scene/SN4DGSSplats.h (179 行) / .cpp
+
+  SN4DGSSplats 继承 SNSplats:
+
+    规范态高斯: dmng.data (继承自 SNSplats, 由 GSPlyLoader 加载)
+
+    Deform4DGSConfig:
+      shDegree       = 3       (SH 阶数)
+      nGaussians     = 0       (高斯总数)
+      formatVersion  = "1.0"   (格式版本)
+      → loadFromFile(jsonPath) 从 config.json 解析
+
+    Deform4DGSBuffer (设备端变形输出缓冲):
+      vm_deformedPosition, vm_deformedScale, vm_deformedRotation
+      cptr_deformedPosition/Scale/Rotation — CUdeviceptr 原始指针
+      allocDevice(numSplats) / freeDevice()
+
+    变形模块 (TorchScript):
+      #ifdef SPLATSHOP_HAS_LIBTORCH
+        std::unique_ptr<torch::jit::script::Module> deformModule;
+      #else
+        std::unique_ptr<void, void(*)(void*)> deformModule;  // 桩
+      #endif
+
+    状态:
+      currentTime          = 0.0f     (归一化时间 [0,1])
+      needsRecompute       = true     (原子标记, 编辑后强制重算)
+      deformationEnabled   = true     (变形开关, 关=看规范态)
+      canonicalPosition    = nullptr  (保存的规范态指针)
+      canonicalScale       = nullptr
+      canonicalQuaternion  = nullptr
+
+3.2.3 LibTorch 集成架构
+────────────────────────────────────────────────────────────────
+
+  依赖隔离:
+    • 仅 SN4DGSSplats.cpp 包含 <torch/script.h>
+    • 所有 4DGS 代码由 #ifdef SPLATSHOP_HAS_LIBTORCH 守卫
+    • 若无 LibTorch: 桩实现 (节点变成直通, 规范态=变形态, 打印警告)
+
+  正向传播管线 (runDeformation):
+    ① 从 dmng.data 提取规范态数据为 CUDA 设备指针
+    ② torch::from_blob(ptr, sizes, torch::kCUDA) — 零拷贝包装
+       (直接指向 Splatshop 自己的 CUDA 缓冲区, 不复制)
+    ③ 传入: positions, scales, quaternions, 中性 opacity, time
+    ④ deformModule->forward(inputs).toTuple() — TorchScript 执行
+    ⑤ cuMemcpyDtoDAsync — 将输出复制到 Deform4DGSBuffer
+       (所有操作在同一 CUDA 流上异步完成)
+
+3.2.4 指针交换机制
+────────────────────────────────────────────────────────────────
+
+  swapToDeformed():
+    保存 dmng.data.position/scale/quaternion → canonicalPosition 等
+    回填 dmng.data.position/scale/quaternion → deformedBuffer 的指针
+    → 渲染内核现在读取变形数据 (无需修改内核代码)
+
+  swapToCanonical():
+    恢复 dmng.data.position/scale/quaternion → canonicalPosition 等
+    → 渲染完成后数据回到规范态
+
+  流同步:
+    deform() 在 mainstream 上排队 cuMemcpyDtoDAsync
+    → 记录 CUDA 事件 deformEvent
+    → 每个渲染目标的流在执行 staging 内核前等待 deformEvent
+    → 保证变形复制完成后再开始读取
+
+3.2.5 增量计算优化
+────────────────────────────────────────────────────────────────
+
+  变形仅在以下情况重新计算:
+    • currentTime 变化超过 1e-6 (时间步进)
+    • needsRecompute 被设置为 true (编辑规范态后)
+    • 首次加载
+
+  deform() 开头检查: 若时间和 dirty 标志均未变化 → 直接返回 (无操作)
+
+3.2.6 编辑工作流
+────────────────────────────────────────────────────────────────
+
+  ① 暂停时间线 → 变形网络停在当前帧
+  ② 用现有工具选择/删除/绘制规范态高斯
+  ③ 自动设置 needsRecompute = true
+  ④ 恢复播放 → 下一帧重新变形, 编辑反映到所有后续帧
+  ⑤ 关闭 deformationEnabled → 临时查看/对比规范态
+
+3.2.7 导出工具
+────────────────────────────────────────────────────────────────
+
+  tools/export_4dgs_torchscript.py:
+
+  输入: • hustvl/4DGaussians 训练检查点 (.pth) + 规范态 .ply
+
+  流程:
+    ① 从检查点加载 state_dict
+    ② 重建 _DeformationWrapper 模块 (HexPlane 网格平面 + MLP 头)
+    ③ torch.jit.trace() 追踪到 TorchScript
+    ④ 输出目录: canonical.ply + deformation_model.pt + config.json
+
+  使用:
+    python tools/export_4dgs_torchscript.py \
+      --checkpoint <4DGaussians>/output/dnerf/lego/chkpnt30000.pth \
+      --ply .../point_cloud/iteration_30000/point_cloud.ply \
+      --out lego_4dgs
+
+3.2.8 使用流程
+────────────────────────────────────────────────────────────────
+
+  ① 启动 Splatshop
+  ② 拖放 canonical.ply → 加载规范态
+  ③ 工具栏 → Motion 面板 → 4DGS Dynamic Scene
+  ④ Import model → 选择 deformation_model.pt
+  ⑤ 播放/暂停/拖拽/调速
+  ⑥ 时间线在 [0.0, 1.0] 间反弹循环
+
+3.2.9 GUI 面板
+────────────────────────────────────────────────────────────────
+
+  src/gui/motion.h:
+    • Import 4DGS Bundle 对话框
+    • 4DGS Dynamic Scene 播放器区域
+    • 变形激活开关
+    • 时间拖拽/速度控制
+
+================================================================================
+3.3  远程控制 API ★
+================================================================================
+
+3.3.1 总体架构
+────────────────────────────────────────────────────────────────
+
+  三层桥接设计:
+
+  远程客户端 (HTTP)
+      │ POST /camera/orbit, /mouse/move, ...
+      ▼
+  FastAPI (Python, :8080)          ← remote_api/server.py (686 行)
+      │ TCP JSON-RPC                ← remote_api/splat_client.py (92 行)
+      ▼
+  RemoteControlServer (C++, :7654) ← src/remote/RemoteControlServer.h/.cpp
+      │ EventQueue (schedule)
+      ▼
+  SplatEditor 主线程 (render loop)
+
+  控制通道和视频通道刻意分离:
+    • 控制: 小包高频姿态 + 低频命令 (通过本 API)
+    • 视频: 独立帧流管道 (OBS/WebRTC/NVENC, 不经过此 API)
+
+3.3.2 C++ 端设计
+────────────────────────────────────────────────────────────────
+
+  remote::RemoteControlServer (src/remote/RemoteControlServer.h):
+
+    start(port = 7654):
+      • 绑定 127.0.0.1:port (仅 loopback, 安全)
+      • 生成分离的监听线程
+      • 每个连接生成分离的处理线程 (支持并发客户端)
+
+    listenerMain(port):
+      accept 循环 → 为每个客户端套接字生成线程
+
+    handleConnection(sock):
+      while 读取一行 → JSON 解析 → 主线程调度 → 写响应
+      (单次往返, 非持久连接)
+
+  主线程调度 (核心模式):
+    runOnMainThread(id, cmd, args):
+      • 创建 std::promise<json> + std::future<json>
+      • schedule([promise, handler, args]{ ... })
+        → 利用 EventQueue 将 lambda 入队到渲染线程
+      • 渲染循环每帧排空 EventQueue
+      • 套接字线程阻塞 fut.wait_for(10s)  → 响应在一个帧内返回 (~16ms)
+      • 10 秒超时: 看门狗保护主线程
+
+  实现了 27 个命令处理器。
+
+3.3.3 通信协议
+────────────────────────────────────────────────────────────────
+
+  请求格式:
+    {"id": <int>, "cmd": "<name>", "args": { ... }}
+    (一行一个 JSON 对象, UTF-8, '\n' 结束)
+
+  响应格式:
+    成功: {"id": <int>, "ok": true,  "data": { ... }}
+    失败: {"id": <int>, "ok": false, "error": "<message>"}
+
+3.3.4 Python 端设计
+────────────────────────────────────────────────────────────────
+
+  remote_api/server.py (686 行) — FastAPI 应用:
+    • 每个请求创建新的短生命周期 TCP 连接到 C++ 桥
+      (无状态, 无共享流竞态)
+    • CORS 启用 (跨域浏览器客户端)
+    • 可选认证: X-Splat-Token 头部 vs SPAT_API_TOKEN 环境变量
+    • GET /test — 自包含 HTML 测试台 (鼠标区域, 相机控制,
+      键盘注入, 节点表格, splats 创建 UI)
+
+  remote_api/splat_client.py (92 行) — TCP JSON-RPC 客户端:
+    • 线程安全的自增请求 ID
+    • 成功返回 data 载荷
+    • 失败抛出 BridgeUnavailable 或 BridgeError
+
+  remote_api/models.py (241 行) — Pydantic 请求/响应模型:
+    OrbitRequest, PanRequest, ZoomRequest, CameraPose, FocusRequest
+    MouseMoveRequest, MouseButtonRequest, MouseScrollRequest,
+      MouseEventRequest (含按钮/动作对校验)
+    KeyRequest, KeyPressRequest, KeySequenceRequest
+    Transform, TranslateRequest, RotateRequest, ScaleRequest,
+      AnimateRequest
+    SphereParams, BoxParams, PointsParams, SplatsCreateRequest,
+      LoadFileRequest, SetColorRequest
+    VRPoseRequest (含 pose_space: openvr/webxr/raw_view, 4x4 矩阵数组)
+
+  remote_api/config.py (30 行) — 环境变量配置:
+    SPLAT_BRIDGE_HOST   = 127.0.0.1
+    SPLAT_BRIDGE_PORT   = 7654
+    SPLAT_BRIDGE_TIMEOUT = 11.0s
+    SPLAT_HTTP_HOST     = 0.0.0.0
+    SPLAT_HTTP_PORT     = 8080
+    SPLAT_API_TOKEN     = (空, 不认证)
+
+  remote_api/keymap.py (60 行):
+    GLFW 键名字符串 ↔ GLFW 键码映射 (大小写不敏感)
+    单字符 "A"-"Z", "0"-"9" → ASCII 码
+
+3.3.5 API 命令矩阵
+────────────────────────────────────────────────────────────────
+
+  ┌──────────────────────┬────────────────────────────────────────────────┐
+  │ 类别                 │ 命令                                           │
+  ├──────────────────────┼────────────────────────────────────────────────┤
+  │ 健康检查             │ health — 返回 FPS, 帧计数, 窗口大小            │
+  ├──────────────────────┼────────────────────────────────────────────────┤
+  │ 相机                 │ camera.orbit — 轨道 (yaw/pitch/radius/target) │
+  │                      │ camera.pan, camera.zoom (绝对+增量模式)        │
+  │                      │ camera.pose.set/get — 设置/获取相机姿态        │
+  │                      │ camera.focus — 聚焦包围盒                     │
+  ├──────────────────────┼────────────────────────────────────────────────┤
+  │ VR 远程立体          │ camera.vr.enter — 进入 VIEWMODE_REMOTE_STEREO  │
+  │                      │ camera.vr.exit — 退出远程立体                 │
+  │                      │ camera.vr.pose — 高频姿态包 (3 种姿态空间)    │
+  ├──────────────────────┼────────────────────────────────────────────────┤
+  │ 鼠标                 │ mouse.move — 绝对/相对移动                     │
+  │                      │ mouse.button — 按钮按下/释放                   │
+  │                      │ mouse.scroll — 滚轮                            │
+  │                      │ mouse.event — 复合事件 (单次往返拖拽)         │
+  ├──────────────────────┼────────────────────────────────────────────────┤
+  │ 键盘                 │ keyboard.key — 键注入 (GLFW 键名)              │
+  │                      │ keyboard.press — 按下-保持-释放 便利封装      │
+  │                      │ keyboard.sequence — 打字序列                   │
+  ├──────────────────────┼────────────────────────────────────────────────┤
+  │ 场景与刚体           │ scene.nodes — 枚举场景树                        │
+  │                      │ motion.node.{id}/transform — 获取/设置变换     │
+  │                      │ motion.node.{id}/translate/rotate/scale        │
+  │                      │ motion.node.{id}/animate — Tween 动画          │
+  ├──────────────────────┼────────────────────────────────────────────────┤
+  │ 场景 Splats ★        │ scene.splats.create — 创建原语(sph/box/pts)    │
+  │                      │ scene.splats.load — 加载 .ply/.json 文件       │
+  │                      │ scene.node.{id} DELETE — 删除节点              │
+  │                      │ scene.splats.{id}/color — 设置均匀颜色         │
+  └──────────────────────┴────────────────────────────────────────────────┘
+
+3.3.6 使用示例
+────────────────────────────────────────────────────────────────
+
+  启动:
+    # 1. 从仓库根目录运行 C++ 编辑器
+    ./build/Release/SplatEditor.exe
+
+    # 2. 启动 Python HTTP API (端口 8080)
+    uvicorn remote_api.server:app --host 0.0.0.0 --port 8080
+
+    # 3. 打开浏览器测试页
+    # http://localhost:8080/test
+
+  创建红色球体并动画:
+    # 创建 500 个红色 splats 的球体 → {"id": 15, ...}
+    curl -X POST http://localhost:8080/scene/splats/create \
+      -H "Content-Type: application/json" \
+      -d '{"type":"sphere","params":{"radius":1.5,"count":500,"color":[1,0,0,1]}}'
+
+    # 动画节点 15 平移到 [3,0,0], 1.5 秒, 缓入缓出
+    curl -X POST http://localhost:8080/motion/node/15/animate \
+      -H "Content-Type: application/json" \
+      -d '{"target":{"translation":[3,0,0]},"duration_s":1.5,"ease":"in_out"}'
+
+3.3.7 示例文件
+────────────────────────────────────────────────────────────────
+
+  remote_api/examples/webrtc_receiver.py (186 行):
+    SplatshopClient 类 — HTTP API 的薄封装
+    wait_for_bridge() — 指数退避 0.5–3s 直到 /health 成功
+    demo_orbit_drag() — 60Hz 模拟左键拖拽轨道
+    demo_keyboard_shortcut() — 边沿触发按键
+    demo_animate_object() — 找第一个 SNSplats 节点并动画
+
+================================================================================
+3.4  运动控制与骨骼蒙皮 ★
+================================================================================
+
+3.4.1 整体结构
+────────────────────────────────────────────────────────────────
+
+  目录: src/motion/ (10 个文件)
+
+  ┌─────────────────────────┬──────────────────────────────────────────┐
+  │ 文件                    │ 角色                                     │
+  ├─────────────────────────┼──────────────────────────────────────────┤
+  │ MotionTypes.h           │ 共享数据结构, 自研四元数, 缓动函数       │
+  │ MotionController.h      │ 单节点刚体运动接口                       │
+  │ Timeline.h/.cpp         │ 关键帧驱动动画播放器 + JSON 加载器       │
+  │ RiggedHumanController.h │ 骨骼蒙皮 + 面部 blendshape 控制器        │
+  │ / .cpp                  │                                          │
+  │ ProceduralRigSource.h   │ 程序化测试骨架生成 (5 关节)              │
+  │ / .cpp                  │                                          │
+  │ skinning.cu             │ LBS + blendshape 变形 CUDA 内核          │
+  └─────────────────────────┴──────────────────────────────────────────┘
+
+3.4.2 MotionTypes.h — 共享数据结构
+────────────────────────────────────────────────────────────────
+
+  TransformSample — 分解 T·R·S 的变换 (带 toMatrix/fromMatrix)
+
+  JointPose — 关节局部空间姿态 {rotation(四元数), translation(vec3), scale(vec3)}
+
+  SkeletonPose — 整骨架姿态 (vector<JointPose>)
+
+  FaceData — 52 元素 ARKit 兼容 blendshape 权重数组
+
+  EaseMode 枚举 — Linear / EaseIn / EaseOut / EaseInOut + applyEase()
+
+  自研四元数数学库 (避免 GLM 的 gtc/quaternion 无法干净编译标量参数的问题):
+    quatIdentity, quatMul, slerpQuat, quatToMat4, quatFromMat4,
+    quatToEulerXYZ — 全部使用 std::sin/std::cos
+
+3.4.3 MotionController — 刚体运动
+────────────────────────────────────────────────────────────────
+
+  静态方法类, 通过 node->transform 写入节点局部变换:
+
+  绝对设置: setTransform, setTranslation, setRotation, setScale
+  相对变异: translate (累加平移), rotate (预乘局部旋转), scaleBy
+  获取: getTransform → TransformSample (分解 node->transform)
+
+  setTransformAnimated:
+    • 使用 Tween 系统从当前平滑过渡到目标
+    • durationSeconds 持续时间 + EaseMode 缓动模式
+    • 内插: 平移 mix(), 旋转 slerpQuat(), 缩放 mix()
+    • dispatchKeyframeToMainThread(): 若从非主线程调用, 排队到 EventQueue
+
+3.4.4 Timeline — 关键帧播放器
+────────────────────────────────────────────────────────────────
+
+  纯 CPU 驱动, 无需每帧 CUDA 调度:
+
+  内部数据:
+    vector<TransformTrack> — 每条轨道绑定一个 NodeID
+      vector<TransformKeyframe> — 按时间排序的关键帧
+
+  插值模式: Step / Linear / Slerp (四元数感知旋转 + 线性其他)
+
+  update(scene, dt):
+    推进 playhead → 每条轨道采样 → MotionController::setTransform 写入
+    支持 loop 模式 + 自动停止
+    Start/stop/reset/scrub API
+
+  JSON 加载器 (loadTracksFromJSON):
+    解析节点名 (通过 scene.find() 查找), 插值模式, 关键帧
+    四元数 [x,y,z,w] 数组, 向量 [x,y,z] 数组
+
+3.4.5 RiggedHumanController — 骨骼动画
+────────────────────────────────────────────────────────────────
+
+  每帧流程:
+
+    ① setPose/setFace/setJointPose/setBlendshape → 写入期望姿态 + face
+       → poseDirty = true
+    ② update(scene):
+       对每个脏节点:
+         • 累加关节局部姿态: M_global[i] = M_global[parent] * M_local[i]
+         • 计算蒙皮矩阵: M_skin[i] = M_global[i] * IBP[i] (IBP=逆绑定姿态)
+         • cuMemcpyHtoD → 上传蒙皮矩阵
+    ③ dispatchSkinning(scene):
+       对每个脏 SNRiggedSplats 节点:
+         启动 kernel_skin_splats → 写入 dmng.data 缓冲
+
+3.4.6 ProceduralRigSource — 测试工具
+────────────────────────────────────────────────────────────────
+
+  在 splat 包围盒内沿 Y 轴堆叠 5 关节骨架:
+    root → spine → chest → neck → head
+  每个 splat 按 Y 高度绑定到最近关节 (单骨骼权重 = 1.0)
+  分配: 设备端静止副本 + 蒙皮矩阵缓冲 + 骨骼索引/权重
+
+  用于验证蒙皮管线无需真实绑定资产。
+
+3.4.7 skinning.cu — CUDA 蒙皮内核
+────────────────────────────────────────────────────────────────
+
+  kernel_skin_splats — 每 splat 线性混合蒙皮 (LBS):
+
+  输入: 静止姿态 position/scale/quaternion, boneIndices, boneWeights
+
+  位置: 加权混合 M_skin[i] * restPos
+  旋转/缩放: 加权混合 3x3 旋转 + 缩放提取
+        → 混合 3x3 → 四元数 → qDeformed = qBlend * qRest
+
+  可选面部 blendshape: 用 faceWeights 累加 delta (position/rotation/scale)
+
+  限制: 每 splat 最多 4 根骨骼, 每 blendshape 10 个 float
+
+  输出: 直接写入 dmng.data 缓冲 (原地变形)
+
+================================================================================
+3.5  VR 远程观看 ★
+================================================================================
+
+3.5.1 整体架构
+────────────────────────────────────────────────────────────────
+
+  VR 头显 ──姿态 (HTTP :8080)──► remote_api (FastAPI) ──► Splatshop C++
+                                                                 │
+                                                         VIEWMODE_REMOTE_STEREO
+                                                         立体渲染 (左/右眼)
+                                                                 │
+  VR 头显 ◄──视频 (WebSocket :8081)── FrameStreamer ◄───────────┘
+
+  与现有控制通道互补: 增加了之前缺失的 视频回传通道。
+  控制 = 小包高频姿态; 视频 = 编码帧流。两者刻意解耦。
+
+3.5.2 远程立体视图模式
+────────────────────────────────────────────────────────────────
+
+  VIEWMODE_REMOTE_STEREO — SplatEditor 的第三显示模式
+    (另两个: 桌面单视, VIEWMODE_IMMERSIVE_VR 本地 OpenVR)
+
+  进入时:
+    camera.vr.enter → 切换到 VIEWMODE_REMOTE_STEREO, 停止本地 OpenVR 运行时
+  退出时:
+    camera.vr.exit → 回到桌面模式
+
+  姿态处理 (SplatEditor_update.h, 约 150 行):
+    camera.vr.pose 从 RemoteStereoState (mutex 保护) 读取姿态数据
+    → 组装 viewLeft/viewRight 的 view/proj/VP 矩阵
+    → 三种姿态空间:
+
+3.5.3 三种姿态空间
+────────────────────────────────────────────────────────────────
+
+  ┌──────────────────┬────────────────────────────────────────────────┐
+  │ 姿态空间          │ 处理方式                                       │
+  ├──────────────────┼────────────────────────────────────────────────┤
+  │ POSE_SPACE_WEBXR │ 基变换矩阵 B: WebXR 设备空间 → 应用 GL 空间    │
+  │                  │ 这是主要的浏览器 WebXR 路径                    │
+  ├──────────────────┼────────────────────────────────────────────────┤
+  │ POSE_SPACE_OPENVR│ 应用 flip 变换 (跟踪空间 → GL 空间), 取逆      │
+  │                  │ 复用本地 VR 的 flip 约定                       │
+  ├──────────────────┼────────────────────────────────────────────────┤
+  │ POSE_SPACE_RAW   │ 使用提供的视图矩阵原样                         │
+  │ _VIEW            │ 假设已在应用空间中                             │
+  └──────────────────┴────────────────────────────────────────────────┘
+
+  每种模式提供: 逐眼视图矩阵 (4x4), 投影矩阵 (4x4), 渲染分辨率
+
+3.5.4 WebXR 客户端
+────────────────────────────────────────────────────────────────
+
+  文件: remote_api/examples/vr_webxr_client.html (307 行)
+
+  自包含 HTML/JS 页面, 利用 WebXR Device API (immersive-vr 会话):
+
+  每 XR 帧:
+    ① frame.getViewerPose() → 获取每眼视图/投影矩阵
+    ② POST 到 /vr/pose 为即发即忘 fetch
+       (pose_space: "webxr", 传递逐眼 view/proj/VP 的 flat 16 浮点)
+    ③ 通过 WebSocket :8081 接收 SBS (side-by-side) JPEG 帧
+       • 二进制头协议 (20 字节): magic 0x56524653,
+         左右宽/高, 编码, 长度
+    ④ 用全屏四边形着色器 (UV offset/scale 分割左右半图)
+       渲染到 XRWebGLLayer
+
+  支持 URL 参数: ?host=, ?token=
+  要求: HTTPS 或 localhost (WebXR 安全上下文)
+
+3.5.5 视频编码
+────────────────────────────────────────────────────────────────
+
+  JPEG (默认):
+    • 无外部依赖, 适合局域网验证
+  H.264 NVENC (预备路径):
+    • 由 SPLATSHOP_HAS_NVENC 守卫
+    • 需要 NVIDIA Video Codec SDK (不随 CUDA Toolkit 分发)
+
+================================================================================
+3.6  OrbbecSDK 集成 ★
+================================================================================
+
+  注意: libs/OrbbecSDK/ 目录下包含大量新 vendor 文件 (DLL, 扩展, 示例)
+  由 git 状态确认为新增资产。
+
+3.6.1 集成目的
+────────────────────────────────────────────────────────────────
+
+  OrbbecSDK 是 Orbbec 公司的 RGBD (深度相机) 开发工具包。
+  用于在 Splatshop 中拍摄实时 3D 点云。
+
+3.6.2 集成规模
+────────────────────────────────────────────────────────────────
+
+  Vendored SDK 组件 (位于 libs/OrbbecSDK/):
+    bin/OrbbecSDK.dll                — 主库
+    bin/OrbbecSDKConfig.xml          — 设备配置
+    bin/MultiDeviceSyncConfig.json   — 多设备同步配置
+    bin/OrbbecSDKConfig.md           — 配置文档
+    bin/extensions/depthengine/      — 深度引擎插件
+    bin/extensions/filters/          — 滤镜处理器
+    bin/extensions/firmwareupdater/  — 固件更新器
+    bin/extensions/frameprocessor/   — 帧处理器
+    bin/ob_*.exe (20+ 示例程序)      — 官方示例 (benchmark, depth,
+                                       color, imu, record, etc.)
+    bin/msvcp140*.dll                — MSVC 运行时
+    bin/concrt140.dll                — 并发运行时
+    LICENSE.txt
+
+3.6.3 构建集成 (cmake/orbbec.cmake)
+────────────────────────────────────────────────────────────────
+
+  ADD_ORBBEC(TARGET_NAME) CMake 函数:
+
+  可选依赖, 如 SDK 目录缺失 → 打印警告 + 静默跳过
+  代码由 #ifdef SPLATSHOP_HAS_ORBBEC 守卫
+
+  使用 SDK 自带的 CMake 包配置文件:
+    libs/OrbbecSDK/lib/OrbbecSDKConfig.cmake
+    → 导出导入目标 ob::OrbbecSDK
+
+  Windows 运行时: 构建后复制:
+    OrbbecSDK.dll
+    extensions/ 目录
+    OrbbecSDKConfig.xml
+    → 可执行文件输出目录
+
+3.6.4 场景节点: SNOrbbec
+────────────────────────────────────────────────────────────────
+
+  继承 SNPoints, 增加:
+    frameReady 标志 — 每帧有新数据时设为 true
+    → Update 循环检查 frameReady → 调用专用的全量上传路径
+      (固定大小, 跳过增量 + 渐进式路径)
+    → Draw 循环渲染为标准点云 (HQS 或 Progressive 模式)
+
+================================================================================
+3.7  场景 Splats CRUD API ★
+================================================================================
+
+3.7.1 总览
+────────────────────────────────────────────────────────────────
+
+  此 API 将场景 Splats 的创建、加载、删除和着色能力以 HTTP 端点暴露,
+  便于 Python 程序和远程客户端以程序化方式操控 Splatshop 场景内容。
+
+3.7.2 实现端点
+────────────────────────────────────────────────────────────────
+
+  A. POST /scene/splats/create — 从原语创建 splats
+
+    请求体:
+      {
+        "type": "sphere" | "box" | "points",
+        "params": { ... }  // 类型相关参数
+      }
+
+    SphereParams (球体):
+      {
+        "radius": 1.5,           // 半径
+        "count": 500,            // splat 数量
+        "color": [1.0, 0, 0, 1] // RGBA
+      }
+
+    BoxParams (立方体):
+      {
+        "size": [2.0, 1.5, 1.0],
+        "count": 800,
+        "color": [0, 1.0, 0, 1]
+      }
+
+    PointsParams (点集):
+      {
+        "positions": [[0,0,0], [1,1,1], ...],  // N 个点位置
+        "color": [0, 0, 1.0, 1]                // 统一颜色
+      }
+
+    响应:
+      {
+        "id": 15,           // 新节点 ID
+        "name": "Sphere_0", // 自动生成名称
+        "type": "SNSplats"
+      }
+
+  B. POST /scene/splats/load — 加载文件
+
+    请求体:
+      {
+        "path": "C:/models/bicycle.ply",  // 或相对路径
+        "type": "ply" | "scene_json"     // ply = 高斯泼溅, json = 场景描述
+      }
+
+    响应:
+      {
+        "id": 16,
+        "name": "bicycle.ply",
+        "numSplats": 2_347_890,
+        "loaded": true
+      }
+
+  C. DELETE /scene/node/{id} — 删除节点
+
+    无请求体, 返回:
+      {
+        "removed": true,
+        "was": { "id": 15, "name": "Sphere_0" }
+      }
+
+  D. POST /scene/splats/{id}/color — 设置颜色
+
+    请求体:
+      {
+        "color": [1, 0, 1, 1]  // 统一 RGBA 应用于所有 splat
+      }
+
+    响应:
+      {
+        "id": 15,
+        "color_set": true,
+        "n_colored": 500
+      }
+
+3.7.3 实现位置
+────────────────────────────────────────────────────────────────
+
+  C++ 端: src/remote/RemoteControlServer.cpp
+    → scene.splats.create_sphere, .create_box, .create_points
+    → scene.splats.load_file
+    → scene.node.remove
+    → scene.splats.set_color
+
+  Python 端: remote_api/server.py
+    → POST /scene/splats/create, /scene/splats/load
+    → DELETE /scene/node/{id}
+    → POST /scene/splats/{id}/color
+
+  数据模型: remote_api/models.py
+    → SphereParams, BoxParams, PointsParams
+    → SplatsCreateRequest, LoadFileRequest, SetColorRequest
+
+
+第4章  构建系统
+================================================================================
+
+4.1 项目配置
+────────────────────────────────────────────────────────────────
+
+  CMakeLists.txt:
+    项目名: SplatEditor
+    C++ 标准: C++23
+    CMake 最低: 3.22
+
+4.2 源文件组织
+────────────────────────────────────────────────────────────────
+
+  使用 GLOB + CONFIGURE_DEPENDS 自动发现 (见 2.6 节)
+
+4.3 CMake 辅助模块
+────────────────────────────────────────────────────────────────
+
+  四个文件位于 cmake/:
+
+  common.cmake:
+    • ADD_IMGUI, ADD_IMPLOT, ADD_IMGUIZMO — 绑定 vendored ImGui 库
+    • ADD_GLM — GLM header
+    • ADD_CUDA (Win32/Unix) — 链接 cuda.lib, nvrtc.lib, nvJitLink.lib
+      使用 NVRTC JIT 编译, 不通过 CMake 的 enable_language(CUDA)
+    • ADD_OPENGL — GLEW + 系统 OpenGL
+
+  libtorch.cmake:
+    ADD_LIBTORCH(TARGET_NAME) — 三级解析:
+      ① find_package(Torch QUIET)
+      ② 项目本地 libs/libtorch/ 回退
+      ③ LIBTORCH_PATH 环境变量
+
+    找到时:
+      • 链接 torch, torch_cpu, torch_cuda, c10 等
+      • 定义 SPLATSHOP_HAS_LIBTORCH=1, _GLIBCXX_USE_CXX11_ABI=1
+      • Windows: 复制 DLL 到输出
+    未找到:
+      • 打印警告 "4DGS support will be disabled"
+      • 所有 4DGS 代码由 #ifdef 守卫
+
+  orbbec.cmake:
+    ADD_ORBBEC(TARGET_NAME) — 类似可选集成 (见 3.6 节)
+
+  glfw.cmake:
+    FetchContent 获取 GLFW 3.3.2
+    兼容性修复: 设置 CMAKE_POLICY_VERSION_MINIMUM 3.5
+    (GLFW 3.3.2 声明 cmake_minimum_required(VERSION 2.x),
+     CMake 4.0+ 拒绝, 需策略覆盖)
+
+4.4 平台抽象
+────────────────────────────────────────────────────────────────
+
+  Windows / Linux 分叉点:
+    • ADD_CUDA: 导入库名称 (cuda.lib vs libcudart.so)
+    • GLRenderer: src/win32/GLRenderer.cpp vs src/unix/GLRenderer.cpp
+    • OpenVR: 仅 Windows, Linux 使用 NOpenVRHelper 桩
+
+4.5 第三方依赖
+────────────────────────────────────────────────────────────────
+
+  ┌──────────────┬──────────────────────────────────────────┐
+  │ 库           │ 位置                                      │
+  ├──────────────┼──────────────────────────────────────────┤
+  │ OpenVR 1.16  │ libs/openvr/ (头文件 + DLL + LIB)        │
+  │ Dear ImGui   │ libs/imgui/ (vendored 源码)              │
+  │ ImPlot       │ libs/implot/                              │
+  │ ImGuizmo     │ libs/ImGuizmo/                            │
+  │ GLM          │ libs/glm/ (header-only)                   │
+  │ GLEW         │ libs/glew/ (系统回退)                     │
+  │ GLFW 3.3.2   │ FetchContent (自动下载)                   │
+  │ nlohmann JSON│ include/json/ (header-only)               │
+  │ GPUSorting   │ src/GPUSorting/ (vendored 源码)           │
+  │ OrbbecSDK    │ libs/OrbbecSDK/ ★                         │
+  │ LibTorch     │ 外部, 自动检测 ★                          │
+  │ CUDA 12.4+   │ 系统环境                                  │
+  └──────────────┴──────────────────────────────────────────┘
+
+4.6 快速构建 (Windows)
+────────────────────────────────────────────────────────────────
+
+  前提: CUDA 12.4+, Visual Studio 2022 (17.10.3+), CMake 3.22+
+  推荐 GPU: RTX 4070+ (RTX 5090(D) 验证通过)
+
+    # 1. 配置 (生成 build/SplatEditor.sln)
+    cmake -B build -S .
+
+    # 2. 构建 Release 目标
+    cmake --build build --config Release --target SplatEditor
+
+    # 3. 从仓库根目录运行 (资源相对路径解析)
+    ./build/Release/SplatEditor.exe
+
+  4DGS 设置 (RTX 5090D + CUDA 13.2 快速路径):
+
+    # 步骤 1: 下载 LibTorch cu128
+    curl -L -o libtorch.zip \
+      "https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.6.0%%2Bcu128.zip"
+
+    # 步骤 2: 解压到 libs/libtorch (项目相对, CMake 自动探测)
+    tar -xf libtorch.zip -C libs/
+
+    # 步骤 3: 配置 & 构建
+    cmake -B build -S .
+    cmake --build build --config Release
+
+4.7 LibTorch 版本兼容性
+────────────────────────────────────────────────────────────────
+
+  ┌──────────────┬─────────────────────┬──────────────────────────────┐
+  │ 系统 CUDA    │ GPU                 │ 使用 LibTorch                │
+  ├──────────────┼─────────────────────┼──────────────────────────────┤
+  │ 12.4 – 12.7  │ RTX 30/40 系列      │ cu124 ✓                      │
+  │ 12.8+        │ RTX 50 系列         │ cu128 ✓                      │
+  │ 13.x         │ RTX 5090(D)         │ cu128 ✓ (驱动后向兼容)       │
+  └──────────────┴─────────────────────┴──────────────────────────────┘
+
+  关键: LibTorch 捆绑自有 CUDA 运行时 — 不依赖系统 CUDA Toolkit。
+  系统 CUDA 版本仅需在驱动层面 >= LibTorch CUDA 版本。
+  Splatshop 本身独立于系统 CUDA Toolkit 编译。
+
+
+第5章  已知限制与未来方向
+================================================================================
+
+5.1 当前限制
+────────────────────────────────────────────────────────────────
+
+  • Alpha 学术原型 — 预计较多 bug 和崩溃
+  • VR 仅 Windows — 未解决 Linux OpenVR 集成
+  • 无球谐函数 — 内存需求大且增益有限 (未来探索更经济的 SH 方案)
+  • CUDA Driver API — 启动缓慢 (运行时编译CUDA)
+  • 撤销覆盖不完整
+  • 变换撤销有损 — 尤其缩放 (缩小过多时精度丢失)
+  • 应用冻结: RTX 20xx 系列已知问题 (线段渲染已修复,
+    VR 三角网格可能仍有问题)
+
+5.2 未来方向
+────────────────────────────────────────────────────────────────
+
+  项目目前的首要任务是收集反馈以确定功能和修复的优先级。
+  已知的待完善区域:
+    • 撤销/重做覆盖扩展到所有功能
+    • 以无损精度重构平移/旋转/缩放撤销
+    • Linux OpenVR 集成
+    • 经济的球谐函数编码
+    • NVENC H.264 视频流管道完善
+    • 补全多缓冲分布的 Phase 2/3 特性
+
+
+附录 A: 键盘与鼠标快捷操作
+================================================================================
+
+  桌面操作 (来自 src/update/inputHandlingDesktop.h):
+
+  ┌───────────────────────┬─────────────────────────────────────────────┐
+  │ 操作                  │ 功能                                        │
+  ├───────────────────────┼─────────────────────────────────────────────┤
+  │ 右键                  │ 取消当前操作                                │
+  │ 双击                  │ 移向悬停的 splats                           │
+  │ Ctrl + Z, Ctrl + Y   │ 撤销, 重做                                  │
+  │ 1                     │ 笔刷选择                                    │
+  │ 2                     │ 笔刷删除                                    │
+  │ t                     │ 平移                                        │
+  │ r                     │ 旋转                                        │
+  │ s                     │ 缩放                                        │
+  │ b                     │ 上色                                        │
+  │ Ctrl + D              │ 复制选择到新图层                            │
+  │ Ctrl + E              │ 合并选中图层到下方图层                      │
+  │ Del                   │ 删除选中                                    │
+  └───────────────────────┴─────────────────────────────────────────────┘
+
+
+附录 B: 坐标系统约定
+================================================================================
+
+  • 右手坐标系
+  • Z 轴向上 (Z-up)
+  • 角度: 弧度
+  • 四元数: [x, y, z, w] 数组格式
+  • 矩阵: 列主序 (column-major), flat 16 元素数组
+  • 鼠标坐标: 浏览器约定 (左上角原点), 桥接自动翻转 Y 轴
+
+
+附录 C: 数据格式规范
+================================================================================
+
+  C.1 BIN 格式 (Skye 快速路径)
+  ────────────────────────────────────────────────
+
+  24 字节头:
+    uint32  magic  = 0x11223344
+    uint64  numPoints
+    uint64  pointDataStride = 16  (当前唯一支持值)
+
+  点布局 (16 字节, 小端):
+    float  x (4 字节, offset 0)
+    float  y (4 字节, offset 4)
+    float  z (4 字节, offset 8)
+    uint8  r (1 字节, offset 12)
+    uint8  g (1 字节, offset 13)
+    uint8  b (1 字节, offset 14)
+    uint8  a (1 字节, offset 15)
+
+  C.2 4DGS Bundle 格式
+  ────────────────────────────────────────────────
+
+  目录结构:
+    bundle_dir/
+      canonical.ply           — 规范态 3DGS PLY (标准格式)
+      deformation_model.pt   — TorchScript 变形模块
+      config.json            — 元数据:
+        {
+          "sh_degree": 3,
+          "n_gaussians": 123456,
+          "format_version": "1.0"
+        }
+
+  加载方式:
+   ① 拖放 canonical.ply → Splatshop
+   ② Motion 面板 → Import model → 选 deformation_model.pt
+
+
+附录 D: API 端点完整参考
+================================================================================
+
+  系统端点:
+    GET  /                          — 服务信息
+    GET  /health                    — 桥状态 (fps, frame_count, window_size)
+    GET  /test                      — 浏览器测试页 (自包含 HTML)
+
+  相机:
+    POST /camera/orbit              — 轨道 (yaw, pitch, radius, target)
+    POST /camera/pan                — 平移
+    POST /camera/zoom               — 缩放
+    POST /camera/pose               — 设置姿态
+    GET  /camera/pose               — 获取姿态
+    POST /camera/focus              — 聚焦包围盒
+
+  VR 远程立体:
+    POST /vr/enter                  — 进入远程立体模式
+    POST /vr/exit                   — 退出远程立体
+    POST /vr/pose                   — 高频姿态 (pose_space, 矩阵数组)
+
+  鼠标:
+    POST /mouse/move                — 移动
+    POST /mouse/button              — 按钮
+    POST /mouse/scroll              — 滚轮
+    POST /mouse/event               — 复合事件
+
+  键盘:
+    POST /keyboard/key              — 键注入 (GLFW 键名)
+    POST /keyboard/press            — 单键按下-释放
+    POST /keyboard/sequence         — 序列 (多键按压)
+
+  场景与刚体:
+    GET  /scene/nodes               — 枚举场景树
+    GET  /motion/node/{id}/transform   — 获取变换
+    POST /motion/node/{id}/transform   — 设置变换
+    POST /motion/node/{id}/translate   — 平移
+    POST /motion/node/{id}/rotate      — 旋转
+    POST /motion/node/{id}/scale       — 缩放
+    POST /motion/node/{id}/animate     — Tween 动画
+
+  场景 Splats ★:
+    POST /scene/splats/create       — 创建原语 (sphere/box/points)
+    POST /scene/splats/load         — 加载文件 (.ply/.json)
+    DELETE /scene/node/{id}          — 删除节点
+    POST /scene/splats/{id}/color   — 设置颜色
+
+
+附录 E: 关键源文件索引
+================================================================================
+
+  核心:
+    src/SplatEditor.h                          主编辑器声明
+    src/SplatEditor_draw.h                     渲染管线
+    src/SplatEditor_update.h                   更新管线
+    include/CudaModularProgram.h               CUDA 模块化编程
+    include/HostDeviceInterface.h              设备数据接口
+    include/Points.h                           点云数据结构
+
+  场景节点:
+    src/scene/SNSplats.h                       高斯泼溅节点
+    src/scene/SNRiggedSplats.h                 骨骼蒙皮节点 ★
+    src/scene/SN4DGSSplats.h                   4DGS 动态场景节点 ★
+    src/scene/SNPoints.h                       点云节点
+    src/scene/SNOrbbec.h                       Orbbec 实时点云节点 ★
+    src/scene/ProgressivePointData.h           渐进式点云数据 ★
+
+  渲染:
+    src/render/progressive_points.cu           渐进式点云内核 ★
+    src/motion/skinning.cu                     骨骼蒙皮内核 ★
+
+  远程控制:
+    src/remote/RemoteControlServer.h           C++ 控制桥 ★
+    src/remote/RemoteControlServer.cpp         C++ 桥实现 ★
+    remote_api/server.py                       Python FastAPI 服务 ★
+    remote_api/splat_client.py                  TCP JSON-RPC 客户端 ★
+    remote_api/models.py                       Pydantic 数据模型 ★
+    remote_api/config.py                       配置 ★
+    remote_api/keymap.py                       GLFW 键名映射 ★
+
+  运动:
+    src/motion/MotionTypes.h                   共享类型 + 四元数 ★
+    src/motion/MotionController.h              刚体运动 ★
+    src/motion/Timeline.h/.cpp                  关键帧播放器 ★
+    src/motion/RiggedHumanController.h/.cpp    骨骼动画控制器 ★
+    src/motion/ProceduralRigSource.h/.cpp      测试骨架生成 ★
+
+  示例:
+    remote_api/examples/vr_webxr_client.html   WebXR 客户端 ★
+    remote_api/examples/webrtc_receiver.py     WebRTC 接收器 ★
+
+  加载器:
+    src/loader/BINPointCloudLoader.h           BIN 格式加载器 ★
+    src/loader/PointCloudPlyLoader.h           点云 PLY 加载器 ★
+    src/loader/GSPlyLoader.h                   高斯泼溅 PLY 加载器
+
+  构建:
+    CMakeLists.txt                             主构建
+    cmake/common.cmake                         常用辅助
+    cmake/libtorch.cmake                       LibTorch 集成 ★
+    cmake/orbbec.cmake                         OrbbecSDK 集成 ★
+    cmake/glfw.cmake                           GLFW 集成
+
+  文档:
+    README.md                                  项目说明
+    docs/remote_api.md                         远程 API 详细文档
+    docs/remote_api_requirements.md            API 需求与设计 ★
+
+  工具:
+    tools/export_4dgs_torchscript.py           4DGS 模型导出 ★
+
+  计划文档:
+    .zcode/plans/plan-sess_7da06295.md        Skye 渐进式渲染 ★
+    .zcode/plans/plan-sess_659002cd.md        VR 远程浏览计划 ★
+    .zcode/plans/plan-sess_0f0a15b9.md        运动控制模块 ★
+    .zcode/plans/plan-sess_0ede3fd6.md        场景 Splats API ★
+    .zcode/plans/plan-sess_84e1bca6.md        色彩校正 + Orbbec ★
+    .zcode/plans/plan-sess_b17bc0dd.md        Orbbec GUI 改进 ★
+    .zcode/plans/plan-sess_f04152b0.md        LibTorch 自动检测 ★
+    .zcode/plans/plan-sess_184389bd.md        CMake 4.x 兼容 ★
+
+
+================================================================================
+                           报告结束
+================================================================================
