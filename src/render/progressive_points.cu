@@ -54,20 +54,26 @@ namespace cg = cooperative_groups;
 // A bijection on [0, prime) when prime ≡ 3 (mod 4). Applying it twice gives a
 // pseudo-random but unique target slot for every source index, so a contiguous
 // draw range becomes a uniform random sample of the whole cloud.
-// Uses int64 to avoid overflow of n*n for uint32 indices.
+//
+// The intermediate n*n would overflow a signed int64 for large primes, so we
+// compute in unsigned 64-bit, which is well-defined and portable (unlike
+// __int128, which NVRTC only supports on Linux). This is safe because B2's
+// clamp caps the cloud at PROGRESSIVE_MAX_BUFFERS * PROGRESSIVE_MAX_POINTS_PER_BUFFER
+// ≈ 1.07e9 points, so prime ≤ ~1.07e9 and n*n ≤ ~1.14e18 < UINT64_MAX (1.84e19).
 // ─────────────────────────────────────────────────────────────────────────────
 __device__ __inline__
 int64_t permuteI(int64_t number, int64_t prime) {
 	if (number > prime) return number;
 
-	int64_t q = number * number;
-	int64_t d = q / prime;
-	int64_t residue = q - d * prime;
+	uint64_t n = uint64_t(number);
+	uint64_t p = uint64_t(prime);
+	uint64_t q = n * n;
+	uint64_t residue = q % p;
 
 	if (number <= prime / 2) {
-		return residue;
+		return int64_t(residue);
 	} else {
-		return prime - residue;
+		return int64_t(p - residue);
 	}
 }
 

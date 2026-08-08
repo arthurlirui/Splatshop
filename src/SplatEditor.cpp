@@ -482,6 +482,157 @@ void SplatEditor::updateBoundingBox(PointData& model){
 	cuMemcpyDtoH(&model.max, cptr_max, sizeof(vec3));
 }
 
+// Point-cloud density optimization via voxel-grid downsampling.
+// See src/remesh/points_remesh.cu for the kernel pipeline. Produces a new
+// SNPoints node holding one centroid per occupied voxel of edge voxelSize.
+shared_ptr<SNPoints> SplatEditor::remeshPointCloud(SNPoints* src, float voxelSize, bool adaptiveFill){
+
+	if(src == nullptr) return nullptr;
+	if(voxelSize <= 0.0f) return nullptr;
+
+	auto& in = src->manager.data;
+	uint32_t count = in.count;
+	if(count == 0u){
+		println("remeshPointCloud: source cloud has no points.");
+		return nullptr;
+	}
+
+	// Work in the source cloud's local space (pre-transform) so the voxel grid
+	// is axis-aligned to the cloud, not the world. Use the already-computed
+	// local AABB (manager.data.min/max are in local space; transform is applied
+	// separately by the renderer).
+	vec3 pmin = in.min;
+	vec3 pmax = in.max;
+
+	// Guard against degenerate (flat) clouds by expanding the AABB a hair so
+	// the voxel divisions below are never divide-by-zero.
+	vec3 extent = pmax - pmin;
+	float eps = voxelSize * 1e-3f;
+	if(extent.x < eps) { pmin.x -= eps; pmax.x += eps; }
+	if(extent.y < eps) { pmin.y -= eps; pmax.y += eps; }
+	if(extent.z < eps) { pmin.z -= eps; pmax.z += eps; }
+	extent = pmax - pmin;
+
+	float invH = 1.0f / voxelSize;
+
+	// --- Allocate scratch buffers for keys/values + segment heads ------------
+	// 4 bytes each per point.
+	shared_ptr<CudaVirtualMemory> vm_keys = CURuntime::allocVirtual("remesh_keys");
+	shared_ptr<CudaVirtualMemory> vm_vals = CURuntime::allocVirtual("remesh_vals");
+	shared_ptr<CudaVirtualMemory> vm_seg  = CURuntime::allocVirtual("remesh_seg");
+	vm_keys->commit(sizeof(uint32_t) * count);
+	vm_vals->commit(sizeof(uint32_t) * count);
+	vm_seg ->commit(sizeof(uint32_t) * count);
+
+	CUdeviceptr cptr_keys = vm_keys->cptr;
+	CUdeviceptr cptr_vals = vm_vals->cptr;
+	CUdeviceptr cptr_seg  = vm_seg ->cptr;
+
+	// 1. Per point: compute packed 32-bit voxel key.
+	{
+		void* args[] = {&launchArgs, &in, &cptr_keys, &cptr_vals, &pmin, &invH};
+		prog_points_remesh->launch("kernel_compute_voxelKeys", args, count);
+	}
+
+	// 2. Sort point indices by voxel key. GPUSorting sorts in place into the
+	//    provided buffers (keys/values are overwritten with sorted order).
+	GPUSorting::sort_32bit_keyvalue(count, cptr_keys, cptr_vals, 0, 0, mainstream);
+
+	// The sort runs on `mainstream` (non-blocking) but the subsequent remesh
+	// kernels and GPUPrefixSums run on the default stream (0). Synchronize
+	// here so the sort completes before the stream-0 kernels read the sorted
+	// buffers; without this the two streams race under per-thread-default
+	// stream semantics.
+	cuStreamSynchronize(mainstream);
+
+	// 3. Mark segment heads (1 where a new voxel segment starts).
+	{
+		void* args[] = {&launchArgs, &cptr_keys, &count, &cptr_seg};
+		prog_points_remesh->launch("kernel_mark_seg_heads", args, count);
+	}
+
+	// 4. Exclusive prefix sum of segment heads -> compact output index per
+	//    point. GPUPrefixSums scans in place.
+	GPUPrefixSums::dispatch(count, cptr_seg);
+
+	// Read back the total number of occupied voxels. GPUPrefixSums produced an
+	// exclusive scan of the segment-head flags into cptr_seg, so the segment
+	// id of the last sorted point is cptr_seg[count-1]. The total segment
+	// count is that id plus 1 iff the last point itself starts a new segment
+	// (its key differs from the previous point's key).
+	uint32_t outCount = 0;
+	uint32_t lastCompactIdx = 0;
+	cuMemcpyDtoH(&lastCompactIdx, cptr_seg + sizeof(uint32_t) * (count - 1), sizeof(uint32_t));
+	uint32_t keyLast = 0, keyPrev = 0;
+	cuMemcpyDtoH(&keyLast, cptr_keys + sizeof(uint32_t) * (count - 1), sizeof(uint32_t));
+	if(count >= 2){
+		cuMemcpyDtoH(&keyPrev, cptr_keys + sizeof(uint32_t) * (count - 2), sizeof(uint32_t));
+	}
+	uint32_t lastIsHead = (count == 1) ? 1u : ((keyLast != keyPrev) ? 1u : 0u);
+	outCount = lastCompactIdx + lastIsHead;
+
+	if(outCount == 0u){
+		println("remeshPointCloud: no voxels occupied (unexpected).");
+		return nullptr;
+	}
+
+	println("remeshPointCloud: {} input -> {} output points (voxel size {:.4f})", count, outCount, voxelSize);
+
+	// --- Allocate the output cloud ------------------------------------------
+	auto outPoints = make_shared<Points>();
+	outPoints->name = src->name + " (remesh)";
+	outPoints->numPoints = outCount;
+	outPoints->numPointsLoaded = outCount;
+	outPoints->world = src->points->world;
+	outPoints->min = pmin;
+	outPoints->max = pmax;
+
+	auto outNode = make_shared<SNPoints>(outPoints->name, outPoints);
+	outNode->manager.data.transform = in.transform;
+
+	// Commit device storage for the output cloud: position, color, flags, plus
+	// a temporary per-slot RGBA float accumulator for atomicAdd color summing.
+	outNode->manager.commit(outCount);
+
+	shared_ptr<CudaVirtualMemory> vm_accColor = CURuntime::allocVirtual("remesh_accColor");
+	vm_accColor->commit(sizeof(vec4) * outCount);
+	CUdeviceptr cptr_accColor = vm_accColor->cptr;
+
+	PointData& out = outNode->manager.data;
+	out.count = outCount;
+	out.numUploaded = outCount;
+	out.visible = true;
+	out.min = pmin;
+	out.max = pmax;
+
+	// 5. Zero the output accumulators.
+	{
+		void* args[] = {&launchArgs, &out, &cptr_accColor};
+		prog_points_remesh->launch("kernel_clear_accum", args, outCount);
+	}
+
+	// 6. Accumulate each (sorted) input point into its compacted output slot.
+	{
+		void* args[] = {&launchArgs, &in, &cptr_vals, &cptr_seg, &count, &out, &cptr_accColor};
+		prog_points_remesh->launch("kernel_accumulate", args, count);
+	}
+
+	// 7. Normalize sums -> centroid position + averaged color.
+	{
+		void* args[] = {&launchArgs, &out, &cptr_accColor};
+		prog_points_remesh->launch("kernel_normalize", args, outCount);
+	}
+
+	// 8. Recompute the output AABB (reuses the bounding-box kernel pattern).
+	updateBoundingBox(out);
+
+	// Add the new node to the scene and select it.
+	scene.world->children.push_back(outNode);
+	setSelectedNode(outNode.get());
+
+	return outNode;
+}
+
 // Inserts contents of one node into another node. 
 // Node Types must match.
 void SplatEditor::insertNodeToNode(shared_ptr<SceneNode> node, shared_ptr<SceneNode> layer, bool onlySelected){
@@ -1168,6 +1319,19 @@ void SplatEditor::setImmersiveVrMode(){
 	ovr->start();
 }
 
+void SplatEditor::setRemoteStereoMode(){
+	// External-HMD stereo path: do NOT start the local OpenVR runtime (there
+	// may be no HMD attached). The remote client feeds head/eye poses via the
+	// remote API into `remoteStereo`. We keep ovr stopped so the local HMD
+	// submit block (SplatEditor_render.h) is naturally skipped.
+	ovr->stop();
+	viewmode = VIEWMODE_REMOTE_STEREO;
+	remoteStereo.active = true;
+
+	// reset scene world matrix (mirrors setDesktopMode)
+	scene.world->transform = mat4(1.0f);
+}
+
 shared_ptr<SNSplats> SplatEditor::clone(SNSplats* source){
 
 	shared_ptr<Splats> bogusSplats = make_shared<Splats>();
@@ -1543,6 +1707,7 @@ void SplatEditor::initCudaProgram(){
 		{&prog_gaussians_editing,    "./src/gaussians_editing.cu"},
 		{&prog_points,               "./src/render/points.cu"},
 		{&prog_progressive_points,   "./src/render/progressive_points.cu"},
+		{&prog_points_remesh,        "./src/remesh/points_remesh.cu"},
 		{&prog_triangles,            "./src/render/triangles.cu"},
 		{&prog_lines,                "./src/render/lines.cu"},
 		{&prog_helpers,              "./src/render/helpers.cu"},
@@ -1726,7 +1891,13 @@ void SplatEditor::drawGUI() {
 		makeSaveFileGUI();
 		makeGettingStarted();
 		makeMotionGUI();
-		makePointCloudGUI();
+        makePointCloudGUI();
+        makeRemeshGUI();
+        makePointCloudBAGUI();
+		makeOrbbecGUI();
+		makeOrbbecPreviewGUI();
+		makeOrbbecPointCloudGUI();
+		makeOrbbecCalibrationGUI();
 
 		// { // PROTOTYPING / DEBUG: Toggle between 3DGS and perspective correct scenes and rendering
 
@@ -2318,6 +2489,8 @@ int32_t SplatEditor::getNumDeletedSplats(){
 #include "update/inputHandlingDesktop.h"
 #include "update/inputHandlingVR.h"
 
+#include "remote/FrameStreamer.h"
+
 #include "SplatEditor_draw.h"
 #include "SplatEditor_render.h"
 #include "SplatEditor_update.h"
@@ -2339,3 +2512,8 @@ int32_t SplatEditor::getNumDeletedSplats(){
 #include "gui/gettingStarted.h"
 #include "gui/motion.h"
 #include "gui/pointcloud.h"
+#include "gui/remesh.h"
+#include "gui/pointcloud_ba.h"
+#include "gui/orbbec.h"
+#include "gui/orbbec_preview.h"
+#include "gui/orbbec_calibration.h"

@@ -44,6 +44,11 @@ struct PointCloudPlyHeader {
 	int64_t bytesPerVertex = 0;
 	bool colorIs16bit = false;        // uint16 rgb vs uint8 rgb
 
+	// Type names of x/y/z (e.g. "float", "double", "int"). The binary loader
+	// reads coordinates as float via raw.get<float>, which is only correct when
+	// the property is actually 4-byte float — so load() rejects other types.
+	std::string typeX, typeY, typeZ;
+
 	// Splat-PLY detection: true if the file has gaussian-splat properties.
 	bool isSplatPly = false;
 };
@@ -108,9 +113,9 @@ struct PointCloudPlyLoader {
 				}
 
 				int64_t myOffset = h.isAscii ? int64_t(colIndex) : offset;
-				if      (name == "x" || name == "X") h.offX = myOffset;
-				else if (name == "y" || name == "Y") h.offY = myOffset;
-				else if (name == "z" || name == "Z") h.offZ = myOffset;
+				if      (name == "x" || name == "X") { h.offX = myOffset; h.typeX = type; }
+				else if (name == "y" || name == "Y") { h.offY = myOffset; h.typeY = type; }
+				else if (name == "z" || name == "Z") { h.offZ = myOffset; h.typeZ = type; }
 				else if (name == "r" || name == "red")   { h.offR = myOffset; h.colorIs16bit = (sz == 2); }
 				else if (name == "g" || name == "green") { h.offG = myOffset; h.colorIs16bit = (sz == 2); }
 				else if (name == "b" || name == "blue")  { h.offB = myOffset; h.colorIs16bit = (sz == 2); }
@@ -133,6 +138,22 @@ struct PointCloudPlyLoader {
 		if (header.isSplatPly) {
 			println("PointCloudPlyLoader: '{}' looks like a gaussian-splat PLY; use the splat loader instead.", path);
 			return nullptr;
+		}
+		// The binary path reads coordinates as raw.get<float>, which is only
+		// correct for 4-byte float properties. A non-float coordinate type
+		// (double/int/uint) would misread values and misalign subsequent reads;
+		// reject it rather than silently producing garbage. ASCII parsing is
+		// type-agnostic (it tokenizes via stof), so only the binary path is gated.
+		if (!header.isAscii) {
+			auto isFloatType = [](const string& t) {
+				return t == "float" || t == "float32";
+			};
+			if (!isFloatType(header.typeX) || !isFloatType(header.typeY) || !isFloatType(header.typeZ)) {
+				println("PointCloudPlyLoader: '{}' has non-float x/y/z (got '{}/{}/{}'); "
+				        "binary loader only supports float coordinates.", path,
+				        header.typeX, header.typeY, header.typeZ);
+				return nullptr;
+			}
 		}
 
 		println("PointCloudPlyLoader: {} vertices, ascii={}, color16bit={}", header.numVertices, header.isAscii, header.colorIs16bit);
@@ -168,17 +189,29 @@ struct PointCloudPlyLoader {
 					istringstream ls(line);
 					vector<float> vals;
 					string tok;
-					while (ls >> tok) vals.push_back(stof(tok));
+					// stof throws std::invalid_argument / std::out_of_range on a
+					// bad token; this loop runs on a detached jthread, so an
+					// uncaught exception would call std::terminate. Parse the
+					// whole line defensively and skip it (leaving point i at its
+					// zero default) if any token is malformed.
+					bool lineOk = true;
+					try {
+						while (ls >> tok) vals.push_back(stof(tok));
+					} catch (const std::exception&) {
+						lineOk = false;
+					}
 
-					auto getv = [&](int64_t idx) -> float { return (idx >= 0 && idx < int64_t(vals.size())) ? vals[idx] : 0.0f; };
-					x = getv(header.offX); y = getv(header.offY); z = getv(header.offZ);
-					if (header.colorIs16bit) {
-						r = int(getv(header.offR)); g = int(getv(header.offG)); b = int(getv(header.offB));
-						r = (r > 255) ? r / 256 : r;
-						g = (g > 255) ? g / 256 : g;
-						b = (b > 255) ? b / 256 : b;
-					} else if (header.offR >= 0) {
-						r = int(getv(header.offR)); g = int(getv(header.offG)); b = int(getv(header.offB));
+					if (lineOk) {
+						auto getv = [&](int64_t idx) -> float { return (idx >= 0 && idx < int64_t(vals.size())) ? vals[idx] : 0.0f; };
+						x = getv(header.offX); y = getv(header.offY); z = getv(header.offZ);
+						if (header.colorIs16bit) {
+							r = int(getv(header.offR)); g = int(getv(header.offG)); b = int(getv(header.offB));
+							r = (r > 255) ? r / 256 : r;
+							g = (g > 255) ? g / 256 : g;
+							b = (b > 255) ? b / 256 : b;
+						} else if (header.offR >= 0) {
+							r = int(getv(header.offR)); g = int(getv(header.offG)); b = int(getv(header.offB));
+						}
 					}
 					storePoint(points, i, x, y, z, uint8_t(r), uint8_t(g), uint8_t(b));
 				}
@@ -220,7 +253,7 @@ struct PointCloudPlyLoader {
 			}
 
 			double seconds = now() - tStart;
-			println("PointCloudPlyLoader: loaded {:L} points in {:.3f}s", points->numPointsLoaded, seconds);
+			println("PointCloudPlyLoader: loaded {:L} points in {:.3f}s", points->numPointsLoaded.load(), seconds);
 		});
 
 		t.detach();

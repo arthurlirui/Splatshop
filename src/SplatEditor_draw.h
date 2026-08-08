@@ -1552,10 +1552,9 @@ void SplatEditor::draw(Scene* scene, vector<RenderTarget> targets){
 
 	// 4DGS dynamic scene: deform canonical Gaussians via HexPlane + MLP.
 	// Runs the TorchScript deformation model for each SN4DGSSplats node,
-	// writing the time-dependent position/scale/rotation/opacity into
-	// deformBuffer. The staging step below routes to these deformed buffers
-	// when the node is a SN4DGSSplats.
-	int64_t num4dgsDispatched = 0;
+	// writing the time-dependent position/scale/rotation into deformBuffer, then
+	// swaps dmng.data to point at the deformed buffers so the staging kernels
+	// (drawsplats_3dgs_concurrent*, below) read deformed Gaussians.
 	std::vector<SN4DGSSplats*> deformedNodes4DGS;
 	scene->forEach<SN4DGSSplats>([&](SN4DGSSplats* node) {
 		if (!node->visible) return;
@@ -1566,15 +1565,29 @@ void SplatEditor::draw(Scene* scene, vector<RenderTarget> targets){
 		node->deform(t, mainstream);
 		node->swapToDeformed();
 		deformedNodes4DGS.push_back(node);
-		num4dgsDispatched++;
 	});
 
-	// ... (rest of the draw function remains the same) ...
-
-	// After all splat rendering is complete, restore canonical pointers
-	for (auto* node : deformedNodes4DGS) {
-		node->swapToCanonical();
+	// deform() dispatches cuMemcpyDtoDAsync on this `mainstream`; the splat
+	// staging kernels below run on each target's per-target `mainstream`
+	// (a CU_STREAM_NON_BLOCKING stream created in the cache below). Without a
+	// bridge, staging could race ahead of the deform copies. Record an event on
+	// this stream after the deform dispatch; each per-target stream waits on it
+	// before its first launch. `deformEvent` is 0 when no deform ran this frame,
+	// so the per-target loop skips the wait.
+	CUevent deformEvent = CUevent(0);
+	if (!deformedNodes4DGS.empty()) {
+		static CUevent deformDone = []{
+			CUevent e;
+			CURuntime::check(cuEventCreate(&e, CU_EVENT_DISABLE_TIMING));
+			return e;
+		}();
+		cuEventRecord(deformDone, mainstream);
+		deformEvent = deformDone;
 	}
+
+	// NOTE: swapToCanonical() is called AFTER all splat rendering, at the very
+	// end of draw() — restoring here would un-swap before staging reads the
+	// deformed buffers, defeating the deformation. See the end of this function.
 
 	// Stuff that only needs to be done once for all targets
 	vector<SNPoints*> nodes;
@@ -1662,6 +1675,14 @@ void SplatEditor::draw(Scene* scene, vector<RenderTarget> targets){
 		CUstream mainstream = concurrent.mainstream;
 		CUstream sidestream = concurrent.sidestream;
 
+		// Wait for this frame's 4DGS deformation copies (dispatched on the
+		// editor's mainstream above) before any per-target launch reads dmng.data.
+		// deformEvent is 0 when no deform ran this frame → skip the wait.
+		if (deformEvent != CUevent(0)) {
+			cuStreamWaitEvent(mainstream, deformEvent, CU_EVENT_WAIT_DEFAULT);
+			cuStreamWaitEvent(sidestream, deformEvent, CU_EVENT_WAIT_DEFAULT);
+		}
+
 		prog_gaussians_rendering->launch("kernel_clearFramebuffer", {&launchArgs, &target}, target.width * target.height, mainstream);
 
 		if(nodes.size() > 0)
@@ -1704,7 +1725,16 @@ void SplatEditor::draw(Scene* scene, vector<RenderTarget> targets){
 
 				// colors
 				for(SNPoints* node : hqsNodes){
-					prog_points->launch("kernel_hqs_color", {&launchArgs, &node->manager.data, &target, &virt_fb_depth->cptr, &virt_fb_color->cptr, &pointSize}, node->manager.data.count, mainstream);
+					// Apply the live color-correction preview only to the
+					// selected node, mirroring the splat render-time preview
+					// path in scene->process<SNSplats> above. An unselected
+					// node gets a default-constructed ColorCorrection, which
+					// applyColorCorrection leaves unchanged.
+					ColorCorrection cc;
+					if(node->selected){
+						cc = settings.colorCorrection;
+					}
+					prog_points->launch("kernel_hqs_color", {&launchArgs, &node->manager.data, &target, &virt_fb_depth->cptr, &virt_fb_color->cptr, &pointSize, &cc}, node->manager.data.count, mainstream);
 				}
 
 				// normalize and transfer to target.framebuffer
@@ -1874,5 +1904,15 @@ void SplatEditor::draw(Scene* scene, vector<RenderTarget> targets){
 
 	}else if(settings.splatRenderer == SPLATRENDERER_PERSPECTIVE_CORRECT){
 		drawsplats_perspectiveCorrect_concurrent(scene, concurrentTargets);
+	}
+
+	// All splat rendering (drawsplats_3dgs_concurrent*, above) has now consumed
+	// the deformed dmng.data for any SN4DGSSplats nodes. Restore canonical
+	// pointers so the next frame's deform() writes into the canonical buffers
+	// and so non-render reads (editing, stats, GPU-mem reports) see canonical
+	// data. This MUST come after the splat render dispatch, not after the deform
+	// dispatch — otherwise staging would read canonical (rest-pose) Gaussians.
+	for (auto* node : deformedNodes4DGS) {
+		node->swapToCanonical();
 	}
 }

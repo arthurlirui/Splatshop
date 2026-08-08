@@ -8,6 +8,7 @@
 #include "../motion/ProceduralRigSource.h"
 #include "../scene/SNRiggedSplats.h"
 #include "../scene/SN4DGSSplats.h"
+#include "../loader/GSPlyLoader.h"
 
 using namespace motion;
 
@@ -165,6 +166,65 @@ void SplatEditor::makeMotionGUI(){
 
 			// --- 4DGS Dynamic Scene Player --------------------------------
 			if(ImGui::CollapsingHeader("4DGS Dynamic Scene", ImGuiTreeNodeFlags_DefaultOpen)){
+
+				// Import dialog: load a canonical .ply + a TorchScript .pt and build
+				// an SN4DGSSplats node. Paths default to the same bundle directory
+				// (as written by tools/export_4dgs_torchscript.py). config.json is
+				// optional — Deform4DGSConfig::loadFromFile falls back to defaults.
+				if(settings.show4DGSImportDialog){
+					ImGui::SetNextWindowSize(ImVec2(540, 180), ImGuiCond_FirstUseEver);
+					static char plyBuf[512] = "";
+					static char ptBuf[512]  = "";
+					ImGui::OpenPopup("Import 4DGS Bundle##4dgsdlg");
+					if(ImGui::BeginPopupModal("Import 4DGS Bundle##4dgsdlg", &settings.show4DGSImportDialog, ImGuiWindowFlags_NoResize)){
+
+						ImGui::TextDisabled("Canonical PLY (rest-pose Gaussians):");
+						ImGui::PushItemWidth(-1);
+						ImGui::InputText("##4dgsply", plyBuf, sizeof(plyBuf));
+						ImGui::PopItemWidth();
+
+						ImGui::TextDisabled("Deformation model (TorchScript .pt):");
+						ImGui::PushItemWidth(-1);
+						ImGui::InputText("##4dgspt", ptBuf, sizeof(ptBuf));
+						ImGui::PopItemWidth();
+
+						ImGui::Separator();
+
+						if(ImGui::Button("Import", ImVec2(120, 0))){
+							string plyPath(plyBuf);
+							string ptPath(ptBuf);
+							namespace fs = std::filesystem;
+
+							auto splats = GSPlyLoader::load(plyPath);
+							if(!splats){
+								println("4DGS import: failed to load canonical PLY '{}'", plyPath);
+							}else if(!fs::exists(ptPath)){
+								println("4DGS import: deformation model not found '{}'", ptPath);
+							}else{
+								// config.json is optional and lives next to the .pt.
+								string cfgPath = (fs::path(ptPath).parent_path() / "config.json").string();
+								Deform4DGSConfig cfg = Deform4DGSConfig::loadFromFile(cfgPath);
+
+								auto node = make_shared<SN4DGSSplats>(
+									fs::path(plyPath).filename().string() + "_4dgs",
+									splats, ptPath, cfg);
+								scene.world->children.push_back(node);
+								editor->setSelectedNode(node.get());
+								Runtime::controls->focus(splats->min, splats->max, 1.0f);
+								println("4DGS import: created node '{}' ({} gaussians, shDegree={})",
+									node->name, cfg.nGaussians, cfg.shDegree);
+							}
+							settings.show4DGSImportDialog = false;
+						}
+						ImGui::SameLine();
+						if(ImGui::Button("Cancel", ImVec2(120, 0))){
+							settings.show4DGSImportDialog = false;
+						}
+
+						ImGui::EndPopup();
+					}
+				}
+
 				// Check if any SN4DGSSplats nodes exist in the scene
 				bool has4DGS = false;
 				size_t num4DGS = 0;
@@ -175,7 +235,9 @@ void SplatEditor::makeMotionGUI(){
 
 				if(!has4DGS){
 					ImGui::TextDisabled("No 4DGS nodes in the scene.");
-					ImGui::TextDisabled("Import a 4DGS model (canonical.ply + deformation_model.pt).");
+					if(ImGui::Button("Import 4DGS Bundle...##4dgsopen")){
+						settings.show4DGSImportDialog = true;
+					}
 				}else{
 					ImGui::Text("4DGS nodes: %zu", num4DGS);
 

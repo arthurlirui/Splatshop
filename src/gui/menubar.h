@@ -48,6 +48,10 @@ void SplatEditor::makeMenubar(){
 				settings.showPointCloudLoadDialog = true;
 			}
 
+			if (ImGui::MenuItem("Import 4DGS Bundle...", "")) {
+				settings.show4DGSImportDialog = true;
+			}
+
 			// ImGui::Separator();
 
 			// if (ImGui::MenuItem("Quit", "Esc")) {
@@ -105,6 +109,45 @@ void SplatEditor::makeMenubar(){
 			editor->settings.showPointCloud = !editor->settings.showPointCloud;
 		}
 		endHighlightButtonIf();
+
+		startHighlightButtonIf(editor->settings.showRemesh);
+		if(ImGui::Button("Remesh")){
+			editor->settings.showRemesh = !editor->settings.showRemesh;
+		}
+		endHighlightButtonIf();
+
+		startHighlightButtonIf(editor->settings.showPointCloudBA);
+		if(ImGui::Button("Bundle Adj.")){
+			editor->settings.showPointCloudBA = !editor->settings.showPointCloudBA;
+		}
+		endHighlightButtonIf();
+
+#ifdef SPLATSHOP_HAS_ORBBEC
+		startHighlightButtonIf(editor->settings.showOrbbec);
+		if(ImGui::Button("Orbbec")){
+			editor->settings.showOrbbec = !editor->settings.showOrbbec;
+		}
+		endHighlightButtonIf();
+
+		startHighlightButtonIf(editor->settings.showOrbbecPreview);
+		if(ImGui::Button("Orbbec Preview")){
+			editor->settings.showOrbbecPreview = !editor->settings.showOrbbecPreview;
+		}
+		endHighlightButtonIf();
+
+		startHighlightButtonIf(editor->settings.showOrbbecPointCloud);
+		if(ImGui::Button("PC View")){
+			editor->settings.showOrbbecPointCloud = !editor->settings.showOrbbecPointCloud;
+		}
+		endHighlightButtonIf();
+#endif
+#ifdef SPLATSHOP_HAS_OPENCV
+		startHighlightButtonIf(editor->settings.showOrbbecCalibration);
+		if(ImGui::Button("Calib")){
+			editor->settings.showOrbbecCalibration = !editor->settings.showOrbbecCalibration;
+		}
+		endHighlightButtonIf();
+#endif
 
 		startHighlightButtonIf(editor->settings.showColorCorrection);
 		if(ImGui::Button("Color Correction")){

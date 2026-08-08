@@ -1,6 +1,7 @@
 #pragma once
 
 
+#include <atomic>
 #include <cmath>
 #include <iostream>
 #include <print>
@@ -28,11 +29,13 @@ struct Points {
 
 	string name;
 
-	int64_t numPoints;
-	int bytesPerPoint;
-	int headerSize;
+	int64_t numPoints = 0;
+	int bytesPerPoint = 0;
+	int headerSize = 0;
 
-	int numPointsLoaded;
+	// Incremented concurrently by loader (jthread) threads and read from the
+	// main render thread, so this must be atomic — matching Splats::numSplatsLoaded.
+	std::atomic<int> numPointsLoaded{0};
 
 	glm::mat4 world;
 

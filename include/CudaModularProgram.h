@@ -196,6 +196,7 @@ struct CudaModule{
 			optInclude.c_str(),
 			"-I ./",
 			"-I ./include",
+			"-I ./src",
 			// GCC predefined macros not available in NVRTC's EDG frontend
 			"-D__FLT_MAX__=3.402823466e+38f",
 			"--relocatable-device-code=true",

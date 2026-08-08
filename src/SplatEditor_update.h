@@ -193,9 +193,21 @@ void SplatEditor::update(){
 	// upload newly loaded points
 	scene.forEach<SNPoints>([&](SNPoints* node) {
 
+#ifdef SPLATSHOP_HAS_ORBBEC
+		// Live Orbbec point clouds are uploaded wholesale each frame by the
+		// dedicated SNOrbbec branch below; skip them here so the append-only
+		// incremental-upload path does not fight the per-frame replacement.
+		if (dynamic_cast<SNOrbbec*>(node) != nullptr) return;
+#endif
+		// BA nodes manage their own buffers (they may borrow device pointers
+		// from a converted source node and run the optimizer each frame);
+		// skip them so this incremental upload path does not commit a
+		// separate CudaVirtualMemory and clobber the borrowed pointers.
+		if (dynamic_cast<SNPointCloudBA*>(node) != nullptr) return;
+
 		auto points = node->points;
 
-		uint64_t numLoaded = points->numPointsLoaded;
+		uint64_t numLoaded = points->numPointsLoaded.load();
 		node->manager.commit(numLoaded);
 		PointData& pd = node->manager.data;
 
@@ -217,7 +229,7 @@ void SplatEditor::update(){
 		// whole cloud, which is what makes the per-frame fill budget bounded. We
 		// only do this when the user has selected the progressive renderer; the
 		// HQS path ignores the shuffled buffers entirely.
-		bool fullyLoaded   = (int64_t)points->numPointsLoaded == points->numPoints && points->numPoints > 0;
+		bool fullyLoaded   = (int64_t)points->numPointsLoaded.load() == points->numPoints && points->numPoints > 0;
 		bool fullyUploaded = pd.numUploaded == (int)numLoaded && numLoaded > 0;
 		if(settings.pointRenderer == POINTRENDERER_PROGRESSIVE
 			&& fullyLoaded && fullyUploaded
@@ -244,6 +256,54 @@ void SplatEditor::update(){
 			println("Progressive: shuffled {:L} points (prime={}, {} buffers) for \"{}\"",
 				numPoints, node->progressive.prime, node->progressive.numBuffers, node->name);
 		}
+	});
+
+#ifdef SPLATSHOP_HAS_ORBBEC
+	// Live Orbbec RGBD point clouds: when a new frame has been copied into the
+	// host buffers (SNOrbbec::frameReady), upload the WHOLE point set to the
+	// device, replacing the previous frame. This is a recurring fixed-size
+	// cloud, so we bypass the append-only incremental path above and the
+	// progressive (shuffled) path (which assumes a static cloud). HQS only.
+	scene.forEach<SNOrbbec>([&](SNOrbbec* node) {
+		if (!node->frameReady.load()) return;
+
+		auto points = node->points;
+		int64_t numPoints = points->numPointsLoaded;
+		if (numPoints <= 0) {
+			node->frameReady.store(false);
+			return;
+		}
+
+		node->manager.commit(numPoints);
+		PointData& pd = node->manager.data;
+
+		// (Re)upload the entire buffer; the host side was filled by
+		// SNOrbbec::loadPointCloud() on the main thread.
+		CURuntime::check(cuMemcpyHtoDAsync((CUdeviceptr)pd.position, points->position->ptr,
+			12ll * numPoints, mainstream));
+		CURuntime::check(cuMemcpyHtoDAsync((CUdeviceptr)pd.color, points->color->ptr,
+			4ll * numPoints, mainstream));
+		CURuntime::check(cuMemsetD32Async((CUdeviceptr)pd.flags, 0, (size_t)numPoints, mainstream));
+
+		pd.count = (uint32_t)numPoints;
+		pd.numUploaded = (uint32_t)numPoints;
+
+		node->frameReady.store(false);
+	});
+#endif
+
+	// GPU bundle-adjustment-style point-cloud refinement (see
+	// docs/ba_research.md). Each frame, for every SNPointCloudBA node that has
+	// optimization enabled, advance a bounded number of AdamW iterations
+	// against the captured target frame. The optimizer writes refined
+	// position/color back into the node's PointDataManager device buffers so
+	// the forward-only point renderer reflects the refinement live. Runs on
+	// the main thread / mainstream, mirroring SNOrbbec's upload branch and
+	// SN4DGSSplats's deform() (CUDA context is bound to the main thread).
+	scene.forEach<SNPointCloudBA>([&](SNPointCloudBA* node) {
+		if (!node->optimizeEnabled) return;
+		if (node->manager.data.count == 0) return;
+		node->runBASteps(mainstream, node->ba.config.stepsPerFrame);
 	});
 
 	
@@ -360,6 +420,102 @@ void SplatEditor::update(){
 			viewRight.view = glm::inverse(flip * poseHMD * poseRight);
 			viewRight.proj = ovr->getProjection(vr::Hmd_Eye::Eye_Right, 0.2, 1'000.0);
 			viewRight.VP = ovr->getProjectionVP(vr::Hmd_Eye::Eye_Right, 0.2, 1'000.0, width, height);
+		}
+		else if(viewmode == VIEWMODE_REMOTE_STEREO)
+		{
+			// External-HMD stereo: poses arrive from a remote client via the
+			// remote API and are buffered in `remoteStereo`. We assemble the
+			// per-eye view/proj/VP the same way the renderer expects them,
+			// honoring the pose's coordinate space.
+			auto& rs = remoteStereo;
+
+			PoseSpace space = POSE_SPACE_WEBXR;
+			glm::dmat4 headPose, eyeLeft, eyeRight;
+			glm::dmat4 rViewLeft, rViewRight, rProjLeft, rProjRight, rVpLeft, rVpRight;
+			bool fresh = false;
+			int width;
+			int height;
+			{
+				// Read ALL shared fields under the mutex - width/height/space
+				// are written by cmd_vr_pose under the same lock, so reading
+				// them outside it would be a data race.
+				std::lock_guard<std::mutex> lk(rs.mutex);
+				width     = rs.width;
+				height    = rs.height;
+				space     = rs.space;
+				headPose  = rs.headPose;
+				eyeLeft   = rs.eyeLeft;
+				eyeRight  = rs.eyeRight;
+				rViewLeft = rs.viewLeft;
+				rViewRight= rs.viewRight;
+				rProjLeft = rs.projLeft;
+				rProjRight= rs.projRight;
+				rVpLeft   = rs.vpLeft;
+				rVpRight  = rs.vpRight;
+				fresh     = rs.fresh;
+				rs.fresh  = false;
+			}
+
+			// clear the eye framebuffers (mirrors the IMMERSIVE_VR path above)
+			glBindFramebuffer(GL_FRAMEBUFFER, viewLeft.framebuffer->handle);
+			glViewport(0, 0, width, height);
+			glClearColor(1.0, 0.0, 0.0, 1.0);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+			glBindFramebuffer(GL_FRAMEBUFFER, viewRight.framebuffer->handle);
+			glViewport(0, 0, width, height);
+			glClearColor(0.0, 1.0, 0.0, 1.0);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+			if(space == POSE_SPACE_OPENVR)
+			{
+				// Same convention as local immersive VR: tracking space (+Y up,
+				// +Z fwd) -> GL (+Z up, +Y fwd) via `flip`, then invert to view.
+				viewLeft.view  = glm::inverse(flip * headPose * eyeLeft);
+				viewRight.view = glm::inverse(flip * headPose * eyeRight);
+				viewLeft.proj  = rProjLeft;
+				viewRight.proj = rProjRight;
+				viewLeft.VP    = rVpLeft;
+				viewRight.VP   = rVpRight;
+			}
+			else if(space == POSE_SPACE_WEBXR)
+			{
+				// WebXR view matrices are world->eye in WebXR's reference space
+				// (+Y up, -Z forward, right-handed, column-major on the wire).
+				// Reproject into the app's GL space (+Z up, +Y forward) via a
+				// change of basis: view_app = B * view_xr * B^-1, where B maps
+				// WebXR axes -> app axes (x->x, y->z, z->-y).
+				//
+				// B (column-major; each column is the image of a source axis):
+				//   col0 = +x_app = (1,0,0)
+				//   col1 = +z_app = image of +y_webxr = (0,0,1)
+				//   col2 = -y_app = image of +z_webxr = (0,-1,0)
+				glm::dmat4 B = glm::dmat4(
+					1.0, 0.0, 0.0, 0.0,
+					0.0, 0.0, 1.0, 0.0,
+					0.0, -1.0, 0.0, 0.0,
+					0.0, 0.0, 0.0, 1.0);
+				glm::dmat4 Binv = glm::inverse(B);
+				viewLeft.view  = B * rViewLeft  * Binv;
+				viewRight.view = B * rViewRight * Binv;
+				viewLeft.proj  = rProjLeft;
+				viewRight.proj = rProjRight;
+				viewLeft.VP    = rVpLeft;
+				viewRight.VP   = rVpRight;
+			}
+			else
+			{
+				// RAW_VIEW: caller already supplies finished view matrices in
+				// the app's GL space (+Z up, +Y fwd). Use verbatim.
+				viewLeft.view  = rViewLeft;
+				viewRight.view = rViewRight;
+				viewLeft.proj  = rProjLeft;
+				viewRight.proj = rProjRight;
+				viewLeft.VP    = rVpLeft;
+				viewRight.VP   = rVpRight;
+			}
 		}
 
 		auto state = ovr->getRightControllerState();

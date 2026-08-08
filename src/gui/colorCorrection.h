@@ -38,11 +38,21 @@ void SplatEditor::makeColorCorrectionGui(){
 			if(ImGui::Button("Apply", buttonSize)){
 				shared_ptr<SceneNode> selected = getSelectedNode();
 
-				onTypeMatch<SNSplats>(selected, [editor](shared_ptr<SNSplats> node){
+				// Bake path: only Gaussian splat nodes have an in-place color
+				// bake kernel (kernel_apply_colorCorrection rewrites
+				// GaussianData.color). Point nodes (SNPoints / SNOrbbec) are
+				// transient/streaming and have no equivalent bake, so for them
+				// Apply just resets the sliders - the live render-time preview
+				// (see SplatEditor_draw.h HQS color launch) already applies the
+				// settings to selected point nodes each frame.
+				bool matchedSplat = false;
+				onTypeMatch<SNSplats>(selected, [editor, &matchedSplat](shared_ptr<SNSplats> node){
 					editor->apply(node->dmng.data, editor->settings.colorCorrection);
+					matchedSplat = true;
 				});
 
 				settings.colorCorrection = ColorCorrection();
+				(void)matchedSplat;
 			}
 
 			// ImGui::SameLine();

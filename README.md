@@ -26,6 +26,9 @@ A precompiled windows binary is available [here](http://users.cg.tuwien.ac.at/ms
 		<li> Object motion control and skeletal skinning (see <code>src/motion/</code>).
 		<li> HTTP-based remote control API: camera / mouse / keyboard / rigid-body motion / Gaussian splats creation, loading, deletion and coloring, drivable from local Python programs or remote WebRTC receivers (see <a href="#remote-control-api">Remote Control API</a>).
 		<li> <b>4D Gaussian Splatting (4DGS) dynamic scene rendering</b> — load and play back dynamic 4DGS scenes trained with <a href="https://github.com/hustvl/4DGaussians">hustvl/4DGaussians</a>. Includes deformation via HexPlane + MLP, timeline controls, and real-time editing of canonical Gaussians (see <a href="#4dgs-dynamic-scenes">4DGS Dynamic Scenes</a>).
+		<li> <b>Point cloud loading &amp; rendering</b> — load <code>.las</code> / <code>.bin</code> / point-cloud <code>.ply</code> files into dedicated <code>SNPoints</code> nodes, rendered either with the all-points HQS path or the Skye-style progressive renderer that scales to hundreds of millions of points via per-frame reprojection + budgeted hole-filling.
+		<li> <b>Point cloud density optimization (remeshing)</b> — voxel-grid downsampling that collapses every occupied voxel of edge <code>h</code> to its centroid, producing a new uniformly-spaced cloud that reduces VRAM and improves render speed while preserving geometric coverage. Non-destructive: the source cloud is kept. Open the <em>Remesh</em> panel from the toolbar (see <code>src/remesh/points_remesh.cu</code>).
+		<li> <b>VR remote viewing</b> - browse a 3D scene from a standalone/PC VR headset over the network: the headset's pose is streamed to the server, which renders stereo left/right eyes and streams them back (see <a href="#vr-remote-viewing">VR Remote Viewing</a>).
 	</ul>
 
 ### Known Issues
@@ -149,11 +152,11 @@ Download the LibTorch C++ distribution from [pytorch.org](https://pytorch.org/ge
 	curl -L -o libtorch.zip ^
 	  "https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.6.0%%2Bcu128.zip"
 
-	# Step 2: Extract to C:\libtorch (or anywhere)
-	tar -xf libtorch.zip -C C:\
+	# Step 2: Extract to libs/libtorch (project-relative, auto-detected by CMake)
+	tar -xf libtorch.zip -C libs/
 
-	# Step 3: Configure & build Splatshop
-	cmake -B build -S . -DTorch_DIR="C:/libtorch/share/cmake/Torch"
+	# Step 3: Configure & build — CMake auto-detects libs/libtorch
+	cmake -B build -S .
 	cmake --build build --config Release
 	```
 
@@ -280,6 +283,30 @@ curl -X POST http://localhost:8080/motion/node/15/animate \
 ```
 
 Full endpoint reference, schemas, WebRTC integration guide and troubleshooting live in [`docs/remote_api.md`](docs/remote_api.md).
+
+## VR Remote Viewing
+
+In addition to local OpenVR rendering, Splatshop can render for a **remote** VR headset (a standalone headset's browser via WebXR, or a PC-VR client) over the network. The headset's 6DOF pose is sent to the server, which renders stereo left/right eyes using the existing Gaussian-splatting rasterizer and streams the frames back to the headset.
+
+```
+VR headset ──pose (HTTP :8080)──► remote_api (FastAPI) ──► Splatshop C++
+                                                                   │ stereo render (VIEWMODE_REMOTE_STEREO)
+VR headset ◄──video (WebSocket :8081)── FrameStreamer ◄────────────┘
+```
+
+This adds the previously-missing **video return channel** alongside the existing control channel - the two are deliberately decoupled (control = small high-frequency pose packets; video = encoded frame stream).
+
+**Using the WebXR client** (standalone headset, e.g. Quest):
+
+1. Start Splatshop and the Python API as in the Remote Control API section.
+2. Serve `remote_api/examples/vr_webxr_client.html` over **HTTPS or localhost** (WebXR requires a secure context) on a machine reachable from the headset's browser.
+3. Open the page in the headset browser, ensure the host points to the Splatshop machine, and click **Enter VR**.
+
+The client reads `XRViewerPose` per-eye view/projection matrices, POSTs them to `/vr/pose` with `pose_space: "webxr"`, and renders the returned side-by-side JPEG frames into the WebXR layer.
+
+**Coordinate spaces** (the most error-prone part - see `docs/remote_api.md` for the full table): `pose_space` selects how the server interprets the matrices. `"webxr"` applies a basis change into the app's GL space; `"openvr"` reuses the local-VR `flip` convention; `"raw_view"` uses matrices already in app space.
+
+**Encoding**: JPEG (default, no external dependency, suitable for LAN validation). H.264 hardware encoding via NVENC is a prepared path gated behind `SPLATSHOP_HAS_NVENC` (requires the NVIDIA Video Codec SDK, not bundled with the CUDA toolkit).
 
 ## Getting Started
 

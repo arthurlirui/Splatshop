@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Splatshop VR Remote Viewer</title>
+<style>
+  html,body { margin:0; height:100%; background:#111; color:#eee;
+              font-family: system-ui, sans-serif; }
+  #overlay { position:fixed; inset:0; display:flex; flex-direction:column;
+             align-items:center; justify-content:center; gap:12px; z-index:10; }
+  button { font-size:18px; padding:12px 24px; cursor:pointer; }
+  #status { font-size:14px; opacity:.8; max-width:600px; text-align:center;
+            line-height:1.4; }
+  #fps { position:fixed; top:8px; left:8px; font:12px monospace; opacity:.6; }
+  #preview { position:fixed; bottom:8px; right:8px; width:240px; height:120px;
+             border:1px solid #444; image-rendering:pixelated; }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <h2>Splatshop VR Remote Viewer</h2>
+  <button id="enterBtn" disabled>Enter VR</button>
+  <div id="status">Checking WebXR support...</div>
+</div>
+<div id="fps"></div>
+<canvas id="preview" width="240" height="120"></canvas>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Configuration. The HTTP API (control/pose) is on :8080 and the WebSocket
+// frame stream is on :8081, both served from the Splatshop host. Override
+// the host via ?host=... in the URL.
+// ---------------------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+const HOST = params.get("host") || location.hostname || "127.0.0.1";
+const HTTP_BASE = `http://${HOST}:8080`;
+const WS_URL = `ws://${HOST}:8081`;
+const TOKEN = params.get("token") || ""; // empty = no auth (default config)
+
+const statusEl = document.getElementById("status");
+const enterBtn = document.getElementById("enterBtn");
+const fpsEl = document.getElementById("fps");
+const previewCanvas = document.getElementById("preview");
+const previewCtx = previewCanvas.getContext("2d");
+
+function setStatus(msg) { statusEl.textContent = msg; console.log(msg); }
+
+// ---------------------------------------------------------------------------
+// 1. Pose upload (control channel): each XR frame, read the viewer pose's
+//    per-eye view/projection matrices and POST them to /vr/pose.
+//    WebXR matrices are column-major Float32Array(16), matching the wire
+//    format the C++ server expects. pose_space="webxr" tells the server to
+//    reprobe them into the app's GL space (+Z up, +Y fwd).
+// ---------------------------------------------------------------------------
+async function postPose(views, framebufferWidth, framebufferHeight) {
+  if (!views || views.length === 0) return;
+  // Build a flat args object. Only left/right are expected; if a view is
+  // missing, the server keeps the previous value for that eye.
+  const args = { pose_space: "webxr",
+                 width: framebufferWidth, height: framebufferHeight };
+  for (const v of views) {
+    const viewArr = Array.from(v.viewMatrix);
+    const projArr = Array.from(v.projectionMatrix);
+    if (v.eye === "left") {
+      args.view_left = viewArr; args.proj_left = projArr;
+    } else if (v.eye === "right") {
+      args.view_right = viewArr; args.proj_right = projArr;
+    }
+  }
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (TOKEN) headers["X-Splat-Token"] = TOKEN;
+    // fetch is fire-and-forget here; we do not await to keep pose latency low.
+    // The server stores the latest pose under a mutex, so overlapping calls
+    // are harmless.
+    fetch(`${HTTP_BASE}/vr/pose`, {
+      method: "POST", headers,
+      body: JSON.stringify(args),
+    }).catch(e => setStatus("pose POST failed: " + e.message));
+  } catch (e) { /* swallow; pose dropouts are tolerable */ }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Video return channel (WebSocket on :8081). Receives binary frames:
+//    header (20 bytes, little-endian) + payload.
+//      u32 magic | u16 sbsW | u16 sbsH | u16 eyeW | u16 eyeH | u16 codec | u32 len | payload
+//    codec 0 = JPEG. We decode the JPEG via createImageBitmap and draw it to
+//    the WebXR baseLayer (and a small on-screen preview).
+// ---------------------------------------------------------------------------
+let latestBitmap = null;
+let latestDims = null;
+let ws = null;
+let wsBackoff = 1000;
+
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { wsBackoff = 1000; setStatus("video stream connected"); };
+  ws.onmessage = async (ev) => {
+    if (typeof ev.data === "string") return;
+    const buf = new Uint8Array(ev.data);
+    if (buf.length < 20) return;
+    const dv = new DataView(ev.data);
+    const magic = dv.getUint32(0, true);
+    if (magic !== 0x56524653) return; // "VRFS"
+    const sbsW = dv.getUint16(4, true);
+    const sbsH = dv.getUint16(6, true);
+    const eyeW = dv.getUint16(8, true);
+    const eyeH = dv.getUint16(10, true);
+    const codec = dv.getUint16(12, true);
+    const len = dv.getUint32(16, true);
+    if (buf.length < 20 + len) return;
+    if (codec !== 0) return; // only JPEG supported in this client
+    const jpegBytes = buf.slice(20, 20 + len);
+    try {
+      const bmp = await createImageBitmap(new Blob([jpegBytes], {type:"image/jpeg"}));
+      if (latestBitmap) latestBitmap.close();
+      latestBitmap = bmp;
+      latestDims = { sbsW, sbsH, eyeW, eyeH };
+    } catch (e) { /* decode error; skip frame */ }
+  };
+  ws.onclose = () => {
+    setStatus("video stream closed; reconnecting in " + (wsBackoff/1000) + "s");
+    ws = null;
+    setTimeout(connectWS, wsBackoff);
+    wsBackoff = Math.min(wsBackoff * 2, 5000);
+  };
+  ws.onerror = () => { try { ws.close(); } catch(e){} };
+}
+
+// ---------------------------------------------------------------------------
+// 3. WebXR session: drive both the pose upload and the frame display.
+// ---------------------------------------------------------------------------
+let gl = null, xrSession = null, xrRefSpace = null;
+let lastPoseTime = 0;
+let frameCount = 0, lastFpsT = performance.now();
+
+async function startXR() {
+  if (!navigator.xr) { setStatus("WebXR not available"); return; }
+  let supported = false;
+  try { supported = await navigator.xr.isSessionSupported("immersive-vr"); }
+  catch(e) { supported = false; }
+  if (!supported) { setStatus("immersive-vr not supported on this device/browser"); return; }
+
+  enterBtn.disabled = false;
+  enterBtn.textContent = "Enter VR";
+  enterBtn.onclick = async () => {
+    try {
+      // Ask for a high frame rate if available (reduces motion-to-photon latency).
+      const sessionOpts = { optionalFeatures: ["local-floor", "bounded-floor"] };
+      xrSession = await navigator.xr.requestSession("immersive-vr", sessionOpts);
+      setStatus("VR session started; entering remote stereo mode...");
+      await fetch(`${HTTP_BASE}/vr/enter`, {
+        method:"POST", headers: tokenHeaders()
+      }).catch(()=>{});
+      onSessionStarted();
+    } catch (e) {
+      setStatus("Failed to start VR session: " + e.message);
+    }
+  };
+  setStatus("Ready. Put on your headset and click Enter VR.");
+}
+
+function tokenHeaders() {
+  const h = { "Content-Type": "application/json" };
+  if (TOKEN) h["X-Splat-Token"] = TOKEN;
+  return h;
+}
+
+async function onSessionStarted() {
+  // Create a WebGL context on a canvas; this becomes the XRWebGLLayer source.
+  const canvas = document.createElement("canvas");
+  gl = canvas.getContext("webgl2", { xrCompatible: true });
+  await gl.makeXRCompatible();
+  const layer = new XRWebGLLayer(xrSession, gl);
+  xrSession.updateRenderState({ baseLayer: layer });
+
+  xrSession.addEventListener("end", onSessionEnded);
+  xrRefSpace = await xrSession.requestReferenceSpace("local-floor");
+
+  connectWS();
+  xrSession.requestAnimationFrame(onXRFrame);
+}
+
+function onSessionEnded() {
+  setStatus("VR session ended.");
+  xrSession = null; xrRefSpace = null;
+  fetch(`${HTTP_BASE}/vr/exit`, {
+    method:"POST", headers: tokenHeaders()
+  }).catch(()=>{});
+  enterBtn.disabled = false;
+}
+
+// A full-screen quad shader pair to blit the decoded SBS bitmap into each
+// eye's half of the framebuffer. The WebXR baseLayer provides the viewport
+// per eye; we draw the left half of the SBS texture into the left viewport
+// and the right half into the right viewport.
+let quadProg = null, quadVBO = null, quadTex = null;
+
+function ensureQuad() {
+  if (quadProg) return;
+  const vs = `attribute vec2 a_pos; varying vec2 v_uv;
+    void main(){ v_uv = a_pos*0.5+0.5; gl_Position = vec4(a_pos,0.0,1.0); }`;
+  const fs = `precision mediump float; varying vec2 v_uv;
+    uniform sampler2D u_tex; uniform vec2 u_uvOff; uniform vec2 u_uvScale;
+    void main(){ gl_FragColor = texture2D(u_tex, u_uvOff + v_uv*u_uvScale); }`;
+  const compile = (t,s)=>{ const sh=gl.createShader(t); gl.shaderSource(sh,s);
+    gl.compileShader(sh); return sh; };
+  quadProg = gl.createProgram();
+  gl.attachShader(quadProg, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(quadProg, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(quadProg);
+  quadVBO = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(
+    [-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+  quadTex = gl.createTexture();
+}
+
+function uploadBitmap(bitmap) {
+  gl.bindTexture(gl.TEXTURE_2D, quadTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function onXRFrame(time, frame) {
+  if (!xrSession) return;
+  const pose = frame.getViewerPose(xrRefSpace);
+  if (!pose) { xrSession.requestAnimationFrame(onXRFrame); return; }
+
+  // --- Upload pose (throttled to ~120Hz; WebXR already caps at display rate) ---
+  if (time - lastPoseTime > 4) {
+    const baseLayer = xrSession.renderState.baseLayer;
+    postPose(pose.views, baseLayer.framebufferWidth, baseLayer.framebufferHeight);
+    lastPoseTime = time;
+  }
+
+  // --- Draw the latest decoded SBS frame into each eye's viewport ---
+  const baseLayer = xrSession.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
+  ensureQuad();
+  gl.useProgram(quadProg);
+
+  if (latestBitmap) {
+    uploadBitmap(latestBitmap);
+    // Update the small on-screen preview too.
+    previewCtx.drawImage(latestBitmap, 0, 0, previewCanvas.width, previewCanvas.height);
+  }
+
+  for (const view of pose.views) {
+    const vp = baseLayer.getViewport(view);
+    gl.viewport(vp.x, vp.y, vp.width, vp.height);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, quadTex);
+    gl.uniform1i(gl.getUniformLocation(quadProg, "u_tex"), 0);
+    // Left eye sees the left half of the SBS image; right eye the right half.
+    if (view.eye === "left") {
+      gl.uniform2f(gl.getUniformLocation(quadProg, "u_uvOff"), 0.0, 0.0);
+      gl.uniform2f(gl.getUniformLocation(quadProg, "u_uvScale"), 0.5, 1.0);
+    } else {
+      gl.uniform2f(gl.getUniformLocation(quadProg, "u_uvOff"), 0.5, 0.0);
+      gl.uniform2f(gl.getUniformLocation(quadProg, "u_uvScale"), 0.5, 1.0);
+    }
+    const loc = gl.getAttribLocation(quadProg, "a_pos");
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  // FPS counter
+  frameCount++;
+  if (time - lastFpsT > 1000) {
+    fpsEl.textContent = `${frameCount} fps`;
+    frameCount = 0; lastFpsT = time;
+  }
+
+  xrSession.requestAnimationFrame(onXRFrame);
+}
+
+// ---------------------------------------------------------------------------
+// Boot.
+// ---------------------------------------------------------------------------
+(async function init() {
+  // Also serve this page itself from the FastAPI server? Not by default -
+  // open the file directly or via any static server. WebXR requires a secure
+  // context (https or localhost), so serve over localhost for development.
+  if (location.protocol !== "https:" &&
+      location.hostname !== "localhost" &&
+      location.hostname !== "127.0.0.1") {
+    setStatus("WebXR requires HTTPS (or localhost). Serve this page via a " +
+              "local static server, e.g. `python -m http.server` on the " +
+              "headset's browser, then open it there.");
+  }
+  setStatus(`Host: ${HOST}  |  Checking WebXR...`);
+  await startXR();
+})();
+</script>
+</body>
+</html>

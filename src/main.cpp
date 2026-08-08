@@ -14,6 +14,7 @@
 #include "ImageLoader.h"
 #include "SplatEditor.h"
 #include "remote/RemoteControlServer.h"
+#include "remote/FrameStreamer.h"
 
 using namespace std;
 
@@ -254,6 +255,12 @@ int main(){
 	// via remote_api/ Python server -> 127.0.0.1:7654). All commands are
 	// marshalled onto this main thread through the EventQueue.
 	remote::RemoteControlServer::start(7654);
+
+	// Start the VR remote-stereo video return channel (WebSocket frame server
+	// on :8081). Captures the rendered stereo eyes and pushes encoded frames
+	// to subscribed WebXR/PC-VR clients. Only does readback work when a client
+	// is connected.
+	remote::FrameStreamer::instance().start(8081);
 
 	{ // load some textures
 		int n;

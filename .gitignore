@@ -95,3 +95,30 @@ splatmodels_benchmark_campus_far/
 splatmodels_statue_1/
 splatmodels_statue2/
 *.pyc
+/libs/libtorch
+/libs/libtorch/include
+/libs/opencv
+/libs/opencv-4.11.0-windows.exe
+# Third-party SDK binaries (import libs, runtime DLLs, SDKs) are NOT
+# committed - per policy no lib/sdk binaries go to GitHub. Users install
+# the SDKs (OrbbecSDK, OpenVR) locally; CMake degrades gracefully when
+# they are absent (camera module / VR stubbed out via feature macros).
+# The entire OrbbecSDK tree is vendored locally only.
+/libs/OrbbecSDK/
+# Import libraries and runtime DLLs for vendored SDKs.
+/libs/**/*.lib
+/libs/**/*.dll
+/libs/**/*.dll.sig
+*.h
+
+# Do NOT ignore source-tree headers: the broad *.h rule above was intended for
+# generated/copied headers, but it also hides first-party headers under src/
+# and include/, which breaks clean-checkout builds (SplatEditor.cpp #includes
+# them). Re-include those directories so new headers are tracked normally.
+# Patterns are anchored with a leading slash so they only match the project's
+# own src/ and include/ trees, NOT vendored libs (e.g. libs/libtorch/include).
+!/src/
+!/include/
+/src/**
+!/src/**/*.h
+!/include/**/*.h

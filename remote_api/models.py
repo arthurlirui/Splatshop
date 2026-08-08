@@ -201,3 +201,40 @@ class LoadFileRequest(BaseModel):
 
 class SetColorRequest(BaseModel):
     color: List[float] = Field(..., min_length=3, max_length=4)
+
+
+# --------------------------------------------------------------------------- #
+# VR remote stereo
+# --------------------------------------------------------------------------- #
+# Feeds an externally-tracked HMD pose into the C++ renderer's
+# VIEWMODE_REMOTE_STEREO path. Matrices are flat 16-element arrays in
+# COLUMN-MAJOR order (the order produced by glm::value_ptr / make_mat4 and by
+# OpenVR/WebXR column-major matrices). See common.h (PoseSpace) for the
+# coordinate-space contract.
+PoseSpace = Literal["openvr", "webxr", "raw_view"]
+
+
+class VRPoseRequest(BaseModel):
+    """One HMD pose packet.
+
+    For ``pose_space="openvr"`` supply head/eye tracking transforms + the
+    per-eye projection/VP. For ``"webxr"``/``"raw_view"`` supply finished
+    per-eye view matrices (world->eye, GL convention) + projection/VP.
+    width/height set the per-eye render target size.
+    """
+    pose_space: PoseSpace = "webxr"
+    # OpenVR tracking-space transforms
+    head_pose: Optional[List[float]] = Field(None, min_length=16, max_length=16)
+    eye_left: Optional[List[float]] = Field(None, min_length=16, max_length=16)
+    eye_right: Optional[List[float]] = Field(None, min_length=16, max_length=16)
+    # Finished view matrices (webxr / raw_view)
+    view_left: Optional[List[float]] = Field(None, min_length=16, max_length=16)
+    view_right: Optional[List[float]] = Field(None, min_length=16, max_length=16)
+    # Per-eye projection + viewport-inclusive VP (all spaces)
+    proj_left: Optional[List[float]] = Field(None, min_length=16, max_length=16)
+    proj_right: Optional[List[float]] = Field(None, min_length=16, max_length=16)
+    vp_left: Optional[List[float]] = Field(None, min_length=16, max_length=16)
+    vp_right: Optional[List[float]] = Field(None, min_length=16, max_length=16)
+    width: Optional[int] = None
+    height: Optional[int] = None
+

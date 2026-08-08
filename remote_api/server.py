@@ -509,6 +509,32 @@ def camera_focus(req: M.FocusRequest):
 
 
 # --------------------------------------------------------------------------- #
+# VR remote stereo
+# --------------------------------------------------------------------------- #
+# Switch the editor into VIEWMODE_REMOTE_STEREO (external-HMD path). Stops the
+# local OpenVR runtime so the HMD-submit block is skipped. The client should
+# call this once before streaming pose packets.
+@app.post("/vr/enter", dependencies=[Depends(_check_token)])
+def vr_enter():
+    return _call("camera.vr.enter", {})
+
+
+# Return to desktop mode and stop accepting remote poses.
+@app.post("/vr/exit", dependencies=[Depends(_check_token)])
+def vr_exit():
+    return _call("camera.vr.exit", {})
+
+
+# High-frequency HMD pose packet. See models.VRPoseRequest for the field
+# contract and the per-pose_space requirements.
+@app.post("/vr/pose", dependencies=[Depends(_check_token)])
+def vr_pose(req: M.VRPoseRequest):
+    args = {k: v for k, v in req.model_dump().items() if v is not None}
+    return _call("camera.vr.pose", args)
+
+
+
+# --------------------------------------------------------------------------- #
 # Mouse
 # --------------------------------------------------------------------------- #
 @app.post("/mouse/move", dependencies=[Depends(_check_token)])

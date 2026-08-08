@@ -32,6 +32,14 @@ struct PointDataManager{
 		vm_position  ->commit(sizeof(*data.position  ) * numSplats);
 		vm_color     ->commit(sizeof(*data.color     ) * numSplats);
 		vm_flags     ->commit(sizeof(*data.flags     ) * numSplats);
+
+		// CudaVirtualMemory::commit() may re-reserve the virtual address range
+		// when the requested size exceeds the current reservation, which
+		// changes cptr. Re-sync the device pointers so they always point at
+		// the live virtual address.
+		data.position = (vec3*)vm_position->cptr;
+		data.color    = (uint32_t*)vm_color->cptr;
+		data.flags    = (uint32_t*)vm_flags->cptr;
 	}
 
 	uint64_t getGpuMemoryUsage(){

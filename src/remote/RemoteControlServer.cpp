@@ -156,6 +156,20 @@ static bool getQuat(const json& a, const char* key, glm::quat& out, bool require
 	return true;
 }
 
+// Read a flat 16-element array into a glm::dmat4. The wire format is column-
+// major (i.e. the order produced by glm::value_ptr / make_mat4), matching how
+// GLM stores matrices and how OpenVR/WebXR column-major matrices serialize.
+static bool getDmat4(const json& a, const char* key, glm::dmat4& out, bool required) {
+	if(!a.contains(key) || a[key].is_null()) return !required;
+	const json& v = a[key];
+	if(!v.is_array() || v.size() < 16) return false;
+	// GLM matrices are column-major: out[col][row].
+	for(int col = 0; col < 4; ++col)
+		for(int row = 0; row < 4; ++row)
+			out[col][row] = v[col * 4 + row].get<double>();
+	return true;
+}
+
 static json transformToJson(const motion::TransformSample& s) {
 	return json{
 		{"translation", {s.translation.x, s.translation.y, s.translation.z}},
@@ -446,6 +460,98 @@ static json cmd_motion_animate(const json& a) {
 	return json{{"duration_s", dur}, {"ease", easeS}};
 }
 
+// --- VR remote stereo ------------------------------------------------------
+// Feeds an externally-tracked HMD pose (e.g. from a browser WebXR session or
+// a remote SteamVR client) into SplatEditor::remoteStereo, which drives
+// VIEWMODE_REMOTE_STEREO. See common.h (PoseSpace) and SplatEditor_update.h
+// for the coordinate-space handling.
+
+static PoseSpace parsePoseSpace(const json& a) {
+	if(!a.contains("pose_space") || a["pose_space"].is_null()) return POSE_SPACE_WEBXR;
+	string s = a["pose_space"].get<string>();
+	if(s == "openvr")    return POSE_SPACE_OPENVR;
+	if(s == "raw_view")  return POSE_SPACE_RAW_VIEW;
+	return POSE_SPACE_WEBXR; // "webxr" or default
+}
+
+// camera.vr.pose - high-frequency pose packet. Either supplies finished
+// per-eye view matrices (webxr / raw_view) or OpenVR tracking-space head +
+// eye-offset transforms + projections (openvr). Optional width/height set the
+// per-eye render target size.
+static json cmd_vr_pose(const json& a) {
+	auto* ed = SplatEditor::instance;
+	if(!ed) throw runtime_error("editor not ready");
+
+	auto& rs = ed->remoteStereo;
+	PoseSpace space = parsePoseSpace(a);
+
+	glm::dmat4 headPose(1.0), eyeLeft(1.0), eyeRight(1.0);
+	glm::dmat4 viewLeft(1.0), viewRight(1.0);
+	glm::dmat4 projLeft(1.0), projRight(1.0), vpLeft(1.0), vpRight(1.0);
+	int width = rs.width, height = rs.height;
+
+	if(space == POSE_SPACE_OPENVR) {
+		getDmat4(a, "head_pose", headPose, false);
+		getDmat4(a, "eye_left",  eyeLeft,  false);
+		getDmat4(a, "eye_right", eyeRight, false);
+		getDmat4(a, "proj_left",  projLeft,  false);
+		getDmat4(a, "proj_right", projRight, false);
+		getDmat4(a, "vp_left",    vpLeft,    false);
+		getDmat4(a, "vp_right",   vpRight,   false);
+	} else {
+		// WEBXR / RAW_VIEW: caller supplies finished view matrices (world->eye).
+		getDmat4(a, "view_left",  viewLeft,  false);
+		getDmat4(a, "view_right", viewRight, false);
+		getDmat4(a, "proj_left",  projLeft,  false);
+		getDmat4(a, "proj_right", projRight, false);
+		getDmat4(a, "vp_left",    vpLeft,    false);
+		getDmat4(a, "vp_right",   vpRight,   false);
+	}
+	if(a.contains("width")  && !a["width"].is_null())  width  = a["width"].get<int>();
+	if(a.contains("height") && !a["height"].is_null()) height = a["height"].get<int>();
+
+	{
+		std::lock_guard<std::mutex> lk(rs.mutex);
+		rs.space     = space;
+		rs.headPose  = headPose;
+		rs.eyeLeft   = eyeLeft;
+		rs.eyeRight  = eyeRight;
+		rs.viewLeft  = viewLeft;
+		rs.viewRight = viewRight;
+		rs.projLeft  = projLeft;
+		rs.projRight = projRight;
+		rs.vpLeft    = vpLeft;
+		rs.vpRight   = vpRight;
+		rs.width     = width;
+		rs.height    = height;
+		rs.fresh     = true;
+	}
+
+	return json{
+		{"mode", "remote_stereo"},
+		{"active", (bool)rs.active},
+		{"width", width}, {"height", height},
+	};
+}
+
+// camera.vr.enter - switch the editor into VIEWMODE_REMOTE_STEREO. Stops the
+// local OpenVR runtime (if any) so the HMD-submit path is skipped.
+static json cmd_vr_enter(const json& /*a*/) {
+	auto* ed = SplatEditor::instance;
+	if(!ed) throw runtime_error("editor not ready");
+	ed->setRemoteStereoMode();
+	return json{{"mode", "remote_stereo"}, {"active", (bool)ed->remoteStereo.active}};
+}
+
+// camera.vr.exit - return to desktop mode and stop accepting remote poses.
+static json cmd_vr_exit(const json& /*a*/) {
+	auto* ed = SplatEditor::instance;
+	if(!ed) throw runtime_error("editor not ready");
+	ed->remoteStereo.active = false;
+	ed->setDesktopMode();
+	return json{{"mode", "desktop"}, {"active", false}};
+}
+
 // --- scene splats create / modify ------------------------------------------
 
 // Helper: attach a freshly-built Splats+SNSplats node to the scene.
@@ -698,6 +804,155 @@ static json cmd_scene_splats_set_color(const json& a) {
 	return json{{"id", id}, {"count", count}, {"color", rgba}};
 }
 
+// ---------------------------------------------------------------------------
+// Point-cloud Bundle-Adjustment refinement (see docs/ba_research.md).
+// Commands operate on a SNPointCloudBA node by id:
+//   scene.points.ba.convert  — convert a selected SNPoints node to a BA node
+//   scene.points.ba.capture  — capture the current rendered view as the BA
+//                              target frame (intrinsics from the desktop camera)
+//   scene.points.ba.start    — enable per-frame optimization
+//   scene.points.ba.stop     — stop optimization (refined cloud stays)
+//   scene.points.ba.status   — return step / loss / running state
+//   scene.points.ba.reset    — drop optimization state
+// ---------------------------------------------------------------------------
+#include "../scene/SNPoints.h"
+#include "../scene/SNPointCloudBA.h"
+
+static SNPointCloudBA* findBANode(int64_t id) {
+	if(!SplatEditor::instance) throw runtime_error("editor not ready");
+	SceneNode* found = nullptr;
+	SplatEditor::instance->scene.root->traverse([&](SceneNode* n){ if(!found && n->ID==id) found=n; });
+	if(!found) throw runtime_error("node not found: " + to_string(id));
+	auto* sn = dynamic_cast<SNPointCloudBA*>(found);
+	if(!sn) throw runtime_error("node is not a Bundle-Adjustment point-cloud node: " + to_string(id));
+	return sn;
+}
+
+static json cmd_scene_points_ba_convert(const json& a) {
+	auto id = a.at("id").get<int64_t>();
+	if(!SplatEditor::instance) throw runtime_error("editor not ready");
+	SceneNode* found = nullptr;
+	SplatEditor::instance->scene.root->traverse([&](SceneNode* n){ if(!found && n->ID==id) found=n; });
+	if(!found) throw runtime_error("node not found: " + to_string(id));
+	auto src = dynamic_cast<SNPoints*>(found);
+	if(!src) throw runtime_error("node is not a point-cloud node: " + to_string(id));
+
+	auto baNode = make_shared<SNPointCloudBA>(src->name + "_BA");
+	baNode->points = src->points;
+	baNode->manager.data.transform = src->manager.data.transform;
+	int64_t n = src->points->numPointsLoaded.load();
+	if (n > 0) {
+		// Deep-copy the device buffers into baNode's own manager. We must NOT
+		// borrow src's raw pointers: they reference memory owned by src's
+		// PointDataManager (vm_position/color/flags), and swapNode() below
+		// drops the last reference to src, freeing that memory - leaving
+		// baNode with dangling pointers. A device-to-device copy keeps baNode
+		// self-contained.
+		baNode->manager.commit(n);
+		baNode->manager.data.count = src->manager.data.count;
+		baNode->manager.data.numUploaded = src->manager.data.numUploaded;
+		CUstream stream = SplatEditor::instance->mainstream;
+		CURuntime::check(cuMemcpyDtoDAsync(
+			reinterpret_cast<CUdeviceptr>(baNode->manager.data.position),
+			reinterpret_cast<CUdeviceptr>(src->manager.data.position),
+			size_t(n) * sizeof(vec3), stream));
+		CURuntime::check(cuMemcpyDtoDAsync(
+			reinterpret_cast<CUdeviceptr>(baNode->manager.data.color),
+			reinterpret_cast<CUdeviceptr>(src->manager.data.color),
+			size_t(n) * sizeof(uint32_t), stream));
+		CURuntime::check(cuMemcpyDtoDAsync(
+			reinterpret_cast<CUdeviceptr>(baNode->manager.data.flags),
+			reinterpret_cast<CUdeviceptr>(src->manager.data.flags),
+			size_t(n) * sizeof(uint32_t), stream));
+		baNode->manager.data.min = src->manager.data.min;
+		baNode->manager.data.max = src->manager.data.max;
+	}
+	// swapNode needs the shared_ptr; find it via a parent walk.
+	shared_ptr<SceneNode> srcShared;
+	SplatEditor::instance->scene.root->traverse([&](SceneNode* parent){
+		for(auto& c : parent->children) if(c.get()==found) srcShared = c;
+	});
+	if(srcShared) SplatEditor::instance->scene.swapNode(srcShared, baNode);
+	return json{{"id", baNode->ID}, {"name", baNode->name}, {"points", n}};
+}
+
+static json cmd_scene_points_ba_capture(const json& a) {
+	auto* node = findBANode(a.at("id").get<int64_t>());
+	int W = GLRenderer::width;
+	int H = GLRenderer::height;
+	if (W <= 0 || H <= 0 || SplatEditor::instance->virt_framebuffer->cptr == 0)
+		throw runtime_error("no valid framebuffer to capture");
+	std::vector<uint64_t> fb(size_t(W) * H);
+	CURuntime::check(cuStreamSynchronize(SplatEditor::instance->mainstream));
+	CURuntime::check(cuMemcpyDtoH(fb.data(),
+		SplatEditor::instance->virt_framebuffer->cptr,
+		size_t(W) * H * sizeof(uint64_t)));
+	std::vector<uint8_t> rgb(size_t(W) * H * 3);
+	for (size_t i = 0; i < fb.size(); ++i) {
+		uint32_t c = uint32_t(fb[i] & 0xffffffffu);
+		rgb[i * 3 + 0] = uint8_t((c >>  0) & 0xff);
+		rgb[i * 3 + 1] = uint8_t((c >>  8) & 0xff);
+		rgb[i * 3 + 2] = uint8_t((c >> 16) & 0xff);
+	}
+	auto& cam = *GLRenderer::camera;
+	float f = 1.0f / float(std::tan(glm::radians(cam.fovy) / 2.0f));
+	float aspect = float(W) / float(H);
+	float fx = (f / aspect) * float(W) * 0.5f;
+	float fy = (f)          * float(H) * 0.5f;
+	glm::mat4 view = glm::mat4(cam.view);
+	std::vector<float> view4x4(16);
+	for (int r = 0; r < 4; ++r)
+		for (int c = 0; c < 4; ++c)
+			view4x4[r * 4 + c] = view[c][r];
+	node->setTargetFrame(rgb.data(), W, H, fx, fy, float(W)*0.5f, float(H)*0.5f, view4x4.data());
+	return json{{"id", node->ID}, {"width", W}, {"height", H}, {"fx", fx}, {"fy", fy}};
+}
+
+static json cmd_scene_points_ba_start(const json& a) {
+	auto* node = findBANode(a.at("id").get<int64_t>());
+	if (a.contains("lr_position")) node->ba.config.lrPosition = a["lr_position"].get<float>();
+	if (a.contains("lr_color"))    node->ba.config.lrColor    = a["lr_color"].get<float>();
+	if (a.contains("init_scale"))  node->ba.config.initScale  = a["init_scale"].get<float>();
+	if (a.contains("steps_per_frame")) node->ba.config.stepsPerFrame = a["steps_per_frame"].get<int>();
+	if (a.contains("max_steps"))   node->ba.config.maxSteps   = a["max_steps"].get<int>();
+	if (a.contains("optimize_position")) node->ba.config.optimizePosition = a["optimize_position"].get<bool>();
+	if (a.contains("optimize_color"))    node->ba.config.optimizeColor    = a["optimize_color"].get<bool>();
+	if (node->targetW <= 0) throw runtime_error("capture a target frame first (scene.points.ba.capture)");
+	node->initRequested.store(true);
+	node->optimizeEnabled = true;
+	return json{{"id", node->ID}, {"running", true}};
+}
+
+static json cmd_scene_points_ba_stop(const json& a) {
+	auto* node = findBANode(a.at("id").get<int64_t>());
+	node->stopOptimize();
+	return json{{"id", node->ID}, {"running", false}};
+}
+
+static json cmd_scene_points_ba_reset(const json& a) {
+	auto* node = findBANode(a.at("id").get<int64_t>());
+	node->ba.reset();
+	return json{{"id", node->ID}, {"initialized", false}};
+}
+
+static json cmd_scene_points_ba_status(const json& a) {
+	auto* node = findBANode(a.at("id").get<int64_t>());
+	auto& st = node->ba.status;
+	return json{
+		{"id", node->ID},
+		{"initialized", st.initialized},
+		{"running", st.running},
+		{"step", st.step},
+		{"loss", st.loss},
+		{"loss_l1", st.lossL1},
+		{"loss_ssim", st.lossSSIM},
+		{"point_count", st.pointCount},
+		{"target_w", st.targetW},
+		{"target_h", st.targetH},
+		{"max_steps", node->ba.config.maxSteps},
+	};
+}
+
 
 // ---------------------------------------------------------------------------
 // Command dispatch table. The dispatcher runs on the main thread.
@@ -713,6 +968,9 @@ static const unordered_map<string, Handler>& handlers() {
 		{"camera.pose.set",       cmd_camera_pose_set},
 		{"camera.pose.get",       cmd_camera_pose_get},
 		{"camera.focus",          cmd_camera_focus},
+		{"camera.vr.pose",        cmd_vr_pose},
+		{"camera.vr.enter",       cmd_vr_enter},
+		{"camera.vr.exit",        cmd_vr_exit},
 		{"mouse.move",            cmd_mouse_move},
 		{"mouse.button",          cmd_mouse_button},
 		{"mouse.scroll",          cmd_mouse_scroll},
@@ -725,6 +983,12 @@ static const unordered_map<string, Handler>& handlers() {
 		{"scene.splats.load_file",     cmd_scene_splats_load_file},
 		{"scene.node.remove",     cmd_scene_node_remove},
 		{"scene.splats.set_color",cmd_scene_splats_set_color},
+		{"scene.points.ba.convert", cmd_scene_points_ba_convert},
+		{"scene.points.ba.capture", cmd_scene_points_ba_capture},
+		{"scene.points.ba.start",   cmd_scene_points_ba_start},
+		{"scene.points.ba.stop",    cmd_scene_points_ba_stop},
+		{"scene.points.ba.reset",   cmd_scene_points_ba_reset},
+		{"scene.points.ba.status",  cmd_scene_points_ba_status},
 		{"motion.get",            cmd_motion_get},
 		{"motion.set_transform",  cmd_motion_set_transform},
 		{"motion.translate",      cmd_motion_translate},

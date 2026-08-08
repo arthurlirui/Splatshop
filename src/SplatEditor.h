@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "glm/gtc/matrix_access.hpp"
 
 #ifdef NO_OPENVR
@@ -17,7 +19,17 @@
 #include "./scene/SN4DGSSplats.h"
 #include "./scene/ImguiNode.h"
 #include "./scene/SNPoints.h"
+#include "./scene/SNPointCloudBA.h"
 #include "./scene/SNTriangles.h"
+#include "./scene/SNOrbbec.h"
+#ifdef SPLATSHOP_HAS_ORBBEC
+#include "./camera/OrbbecCapture.h"
+#endif
+#ifdef SPLATSHOP_HAS_OPENCV
+#include "Calibration.h"
+#include "./calibration/Calibrator.h"
+#include "./calibration/CalibrationStore.h"
+#endif
 
 #include "cuda.h"
 #include "cuda_runtime.h"
@@ -111,12 +123,84 @@ struct SplatEditor{
 	shared_ptr<SNTriangles> sn_dbgsphere = nullptr;
 	shared_ptr<SNSplats> sn_brushsphere = nullptr;
 
+#ifdef SPLATSHOP_HAS_ORBBEC
+	// Orbbec RGBD camera module. orbbecCapture owns the SDK pipeline and
+	// polling thread; snOrbbec is the live point-cloud scene node fed from
+	// it. Both are created lazily from the Orbbec GUI panel.
+	shared_ptr<orbbec::OrbbecCapture> orbbecCapture = nullptr;
+	shared_ptr<SNOrbbec> snOrbbec = nullptr;
+	vector<orbbec::DeviceInfo> orbbecDevices;
+	int orbbecSelectedDevice = 0;
+
+	// --- Orbbec stream config / camera params (persisted as members so
+	//     they survive device switches, unlike the old static locals) ---
+	orbbec::StreamConfig orbbecCfgColor;
+	orbbec::StreamConfig orbbecCfgDepth;
+	orbbec::CameraParams orbbecParams;
+	bool orbbecStreamCfgLoaded = false;
+	bool orbbecParamsLoaded = false;
+	vector<orbbec::StreamConfig> orbbecColorProfiles;
+	vector<orbbec::StreamConfig> orbbecDepthProfiles;
+	int orbbecColorProfileIdx = 0;
+	int orbbecDepthProfileIdx = 0;
+
+	// --- Orbbec real-time preview (RGB + Depth textures in ImGui) ---
+	GLuint orbbecTexColor = 0;
+	GLuint orbbecTexDepth = 0;
+	GLuint orbbecTexDepthRaw = 0;           // raw (pre-filter) depth texture
+	int orbbecTexColorW = 0, orbbecTexColorH = 0, orbbecTexColorBpp = 0;
+	int orbbecTexDepthW = 0, orbbecTexDepthH = 0;
+	int orbbecTexDepthRawW = 0, orbbecTexDepthRawH = 0;
+	vector<uint8_t> orbbecColorScratch;    // YUYV->RGB conversion buffer
+	vector<uint8_t> orbbecDepthScratch;    // depth colormap output buffer
+	vector<uint8_t> orbbecDepthScratchRaw; // raw depth colormap output (before/after compare)
+	vector<uint8_t> orbbecDepthLUT;        // 256x3 colormap lookup table
+	int orbbecDepthLUTType = -1;           // which colormap the LUT was built for
+	shared_ptr<orbbec::RGBDFrame> orbbecPreviewHeldFrame = nullptr; // for pause
+	uint64_t orbbecPreviewFrameIndex = 0;
+
+	// --- Undistortion preview textures (compare mode side-by-side) ---
+	// Separate GL textures + scratch buffers for the undistorted color/depth
+	// so the raw and corrected images can coexist in compare mode.
+	GLuint orbbecTexColorUndist = 0;
+	int orbbecTexColorUndistW = 0, orbbecTexColorUndistH = 0, orbbecTexColorUndistBpp = 0;
+	vector<uint8_t> orbbecColorScratchUndist;   // undistorted color upload buffer
+	GLuint orbbecTexDepthUndist = 0;
+	int orbbecTexDepthUndistW = 0, orbbecTexDepthUndistH = 0;
+	vector<uint8_t> orbbecDepthScratchUndist;   // undistorted depth colormap buffer
+	vector<uint16_t> orbbecDepthUndist16;       // undistorted uint16 depth (pre-colormap)
+
+	// --- Orbbec live point-cloud display panel (runtime state) ---
+	// The GL texture + dedicated CUDA buffers used to render the streaming
+	// SNOrbbec cloud into its own small RenderTarget (see SplatEditor_render.h)
+	// and blit it to an ImGui::Image. Camera state lives on the SNOrbbec node
+	// itself; user-tunable toggles live in `settings`.
+	GLuint orbbecTexPointCloud = 0;        // GL texture receiving the blitted cloud image
+	int orbbecTexPointCloudW = 0, orbbecTexPointCloudH = 0;
+
+	// --- Orbbec lens calibration (runtime state) ---
+	// Calibrator engine + the active device calibration. Texture for the
+	// live detection-overlay preview. All guarded by both ORBBEC and OPENCV
+	// because the Calibrator depends on OpenCV.
+#ifdef SPLATSHOP_HAS_OPENCV
+	std::shared_ptr<orbbec::Calibrator> orbbecCalibrator;
+	orbbec::DeviceCalibration orbbecActiveCalibration;
+	GLuint orbbecCalibTexOverlay = 0;
+	int orbbecCalibTexOverlayW = 0, orbbecCalibTexOverlayH = 0;
+	std::vector<uint8_t> orbbecCalibOverlayScratch;  // BGR8 overlay buffer
+	int orbbecCalibTargetStream = 0;  // 0=Color 1=IR 2=Depth
+	std::string orbbecCalibSavePath;
+	std::string orbbecCalibLoadPath;
+#endif
+#endif
+
 	vector<SceneNode*> scheduledForRemoval;
 
 	CudaModularProgram* prog_gaussians_rendering = nullptr;
 	CudaModularProgram* prog_gaussians_editing = nullptr;
 	CudaModularProgram* prog_points = nullptr;
 	CudaModularProgram* prog_progressive_points = nullptr; // Skye-style progressive point-cloud renderer (port to CUDA)
+	CudaModularProgram* prog_points_remesh = nullptr;     // Point-cloud density optimization (voxel-grid downsampling)
 	CudaModularProgram* prog_triangles = nullptr;
 	CudaModularProgram* prog_lines = nullptr;
 	CudaModularProgram* prog_helpers = nullptr;
@@ -125,6 +209,33 @@ struct SplatEditor{
 	OpenVRHelper* ovr = nullptr;
 	View viewLeft;
 	View viewRight;
+
+	// External (remote-HMD) stereo pose state. Written by the remote control
+	// thread, read by the main render thread under `remoteStereoMutex`.
+	// Drives VIEWMODE_REMOTE_STEREO in SplatEditor_update.h / SplatEditor_render.h.
+	struct RemoteStereoState {
+		// Head pose in tracking space (OPENVR) - combined with eye offsets below.
+		// Ignored for WEBXR/RAW_VIEW, where the eye views are supplied directly.
+		glm::dmat4 headPose     = glm::dmat4(1.0);
+		glm::dmat4 eyeLeft      = glm::dmat4(1.0);   // eye-to-head offset (OPENVR)
+		glm::dmat4 eyeRight     = glm::dmat4(1.0);
+		// Direct view matrices (WEBXR / RAW_VIEW): world->eye, in GL convention.
+		glm::dmat4 viewLeft     = glm::dmat4(1.0);
+		glm::dmat4 viewRight    = glm::dmat4(1.0);
+		// Per-eye projection + viewport-inclusive VP (already GL-space).
+		glm::dmat4 projLeft     = glm::dmat4(1.0);
+		glm::dmat4 projRight    = glm::dmat4(1.0);
+		glm::dmat4 vpLeft       = glm::dmat4(1.0);
+		glm::dmat4 vpRight      = glm::dmat4(1.0);
+		int   width  = 2048;
+		int   height = 2048;
+		PoseSpace space = POSE_SPACE_WEBXR;
+		bool  fresh = false;          // set true on each new pose packet
+		std::atomic<bool> active{false};
+		std::mutex mutex;
+	};
+	RemoteStereoState remoteStereo;
+
 	shared_ptr<Framebuffer> fbGuiVr;
 	shared_ptr<Framebuffer> fbGuiVr_assets;
 	vec2 vrGuiResolution = {1024, 1024};
@@ -267,6 +378,29 @@ struct SplatEditor{
 	bool showMotion = false;
 	bool showPointCloud = false;          // progressive point-cloud control panel
 	bool showPointCloudLoadDialog = false;
+	bool showRemesh = false;              // point-cloud density optimization (voxel downsample) panel
+	float remeshVoxelSize = 0.05f;        // current voxel size h for downsampling (meters)
+	bool showPointCloudBA = false;        // GPU bundle-adjustment-style point-cloud refinement panel
+	bool show4DGSImportDialog = false;    // 4DGS bundle import (canonical.ply + deformation_model.pt)
+#ifdef SPLATSHOP_HAS_ORBBEC
+	bool showOrbbec = false;              // Orbbec RGBD camera control panel
+	bool showOrbbecPreview = false;       // Orbbec RGBD live preview panel
+	bool orbbecPreviewPaused = false;     // freeze the preview on the current frame
+	bool orbbecPreviewAutofit = true;     // auto-fit images to window
+	int  orbbecDepthColormap = 0;         // 0=Turbo 1=Jet 2=Gray 3=Inferno
+	float orbbecDepthMaxMeters = 4.0f;    // max distance for depth normalization
+	bool orbbecDenoiseCompare = false;    // show raw vs denoised depth side-by-side
+	// Orbbec live point-cloud display panel (3D, dedicated window).
+	bool showOrbbecPointCloud = false;    // panel toggle
+	bool orbbecPCPaused = false;          // freeze the panel on the current frame
+	bool orbbecPCAutoFit = true;          // re-frame the camera from the AABB each frame
+	float orbbecPCPointSize = 1.0f;       // HQS splat radius (in pixels)
+	// Orbbec lens calibration panel + software-side undistortion toggles.
+	bool showOrbbecCalibration = false;   // calibration panel toggle
+	// 0 = off (show raw), 1 = on (show undistorted), 2 = compare (side-by-side).
+	int  orbbecUndistortMode = 0;
+	bool orbbecUseCalibratedIntrinsics = false; // use calibrated intrinsics for point cloud
+#endif
 	bool openContextMenu = false;
 
 		bool showInset = false;
@@ -357,6 +491,7 @@ struct SplatEditor{
 	void setDesktopMode();
 	void setDesktopVrMode();
 	void setImmersiveVrMode();
+	void setRemoteStereoMode();
 	shared_ptr<SNSplats> clone(SNSplats* source);
 	void sortSplatsDevice(SNSplats* node, bool putDeletedLast = false);
 	void drawSphere(_DrawSphereArgs args);
@@ -421,6 +556,19 @@ struct SplatEditor{
 	void makeGettingStarted();
 	void makeMotionGUI();
 	void makePointCloudGUI();
+	void makeRemeshGUI();
+	void makePointCloudBAGUI();
+	void makeOrbbecGUI();
+	void makeOrbbecPreviewGUI();
+	void makeOrbbecPointCloudGUI();
+	void makeOrbbecCalibrationGUI();
+
+	// Point-cloud density optimization. Voxel-grid downsampling: collapses every
+	// occupied voxel of edge length voxelSize to its centroid, producing a new
+	// SNPoints node with uniform point spacing ~voxelSize. Non-destructive: the
+	// source cloud is preserved. adaptiveFill is reserved for Phase-2 splitting
+	// of sparse regions and is not yet implemented.
+	shared_ptr<SNPoints> remeshPointCloud(SNPoints* src, float voxelSize, bool adaptiveFill = false);
 
 	// MISC
 	CudaGlMappings mapCudaGl(shared_ptr<GLTexture> source);

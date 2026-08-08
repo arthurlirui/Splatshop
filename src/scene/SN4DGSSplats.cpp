@@ -29,32 +29,20 @@ void Deform4DGSBuffer::allocDevice(int64_t numSplats) {
     vm_deformedPosition = CURuntime::allocVirtual("4dgs_deformedPos");
     vm_deformedScale    = CURuntime::allocVirtual("4dgs_deformedScale");
     vm_deformedRotation = CURuntime::allocVirtual("4dgs_deformedRot");
-    vm_deformedOpacity  = CURuntime::allocVirtual("4dgs_deformedOpacity");
 
     vm_deformedPosition->commit(numSplats * sizeof(float3), true);
     vm_deformedScale   ->commit(numSplats * sizeof(float3), true);
     vm_deformedRotation->commit(numSplats * sizeof(float4), true);
-    vm_deformedOpacity ->commit(numSplats * sizeof(float),  true);
 
     cptr_deformedPosition = vm_deformedPosition->cptr;
     cptr_deformedScale    = vm_deformedScale->cptr;
     cptr_deformedRotation = vm_deformedRotation->cptr;
-    cptr_deformedOpacity  = vm_deformedOpacity->cptr;
 }
 
 void Deform4DGSBuffer::freeDevice() {
     CURuntime::free(vm_deformedPosition);
     CURuntime::free(vm_deformedScale);
     CURuntime::free(vm_deformedRotation);
-    CURuntime::free(vm_deformedOpacity);
-}
-
-// =========================================================================
-// Helper: custom deleter for void* wrapping torch Module
-// =========================================================================
-
-static void deleteTorchModule(void* p) {
-    delete static_cast<torch::jit::script::Module*>(p);
 }
 
 // =========================================================================
@@ -67,22 +55,27 @@ SN4DGSSplats::SN4DGSSplats(std::string name,
                            const Deform4DGSConfig& config)
     : SNSplats(name, splats)
     , deformConfig(config)
-    , deformModule(nullptr, deleteTorchModule)
 {
     if (splats) {
-        int64_t N = splats->numPointsLoaded;
+        // Allocate from the header-declared total (numSplats), NOT the
+        // concurrently-incremented numSplatsLoaded counter: the loader runs on a
+        // detached thread, so numSplatsLoaded is 0/partial at construction time
+        // and runDeformation's D2D copies (sized from data.count, which grows up
+        // to numSplats) would otherwise overflow the allocated deform buffers.
+        int64_t N = splats->numSplats;
+        if (N <= 0) {
+            // Fall back to the loaded count if the header field wasn't set.
+            N = splats->numSplatsLoaded.load();
+        }
         deformBuffer.allocDevice(N);
     }
 
     // Load the TorchScript model
     try {
-        auto* mod = new torch::jit::script::Module(
+        deformModule = std::make_unique<torch::jit::script::Module>(
             torch::jit::load(modelPath, torch::kCUDA)
         );
-        mod->eval();
-        deformModule = std::unique_ptr<void, void(*)(void*)>(
-            mod, deleteTorchModule
-        );
+        deformModule->eval();
 
         println("SN4DGSSplats '{}': loaded TorchScript model from '{}'", name, modelPath);
     } catch (const c10::Error& e) {
@@ -143,8 +136,7 @@ void SN4DGSSplats::deform(float normalizedTime, CUstream stream) {
 }
 
 void SN4DGSSplats::runDeformation(float time, CUstream stream) {
-    auto* mod = static_cast<torch::jit::script::Module*>(deformModule.get());
-    if (!mod) {
+    if (!deformModule) {
         // No model loaded; copy canonical data to deformed buffers as-is
         println("SN4DGSSplats::runDeformation: no model loaded, using identity.");
         return;
@@ -187,62 +179,72 @@ void SN4DGSSplats::runDeformation(float time, CUstream stream) {
         options
     );
 
-    // Opacity: stored per-splat in dmng.data as part of Color struct.
-    // For simplicity, we compute a default opacity tensor.
-    // In a production version, opacity could be extracted from the color alpha
-    // channel or stored separately.
+    // Opacity input: the traced model's forward signature expects a 5th
+    // argument. Splatshop stores opacity inside Color (interleaved with rgb) and
+    // GaussianData has no separate opacity pointer to swap, so we pass a neutral
+    // input and intentionally do NOT consume the model's opacity output — see
+    // the comment below the unpack.
     auto opacity = torch::full({N, 1}, 0.0f, options);
 
     // --- Run the model ---
+    // Wrap forward() + unpack in try/catch: a runtime c10::Error (shape mismatch,
+    // OOM, bad TorchScript) would otherwise propagate out of draw() and terminate
+    // the process. On failure we log and leave deformBuffer un-written, so the
+    // node renders its canonical (rest-pose) Gaussians for this frame.
+    torch::Tensor deformedPos, deformedScale, deformedRot;
+    try {
+        std::vector<torch::IValue> inputs;
+        inputs.push_back(means3D);
+        inputs.push_back(scales);
+        inputs.push_back(rotations);
+        inputs.push_back(opacity);
+        inputs.push_back(time);  // scalar float
 
-    std::vector<torch::IValue> inputs;
-    inputs.push_back(means3D);
-    inputs.push_back(scales);
-    inputs.push_back(rotations);
-    inputs.push_back(opacity);
-    inputs.push_back(time);  // scalar float
+        auto outputs = deformModule->forward(inputs);
 
-    auto outputs = mod->forward(inputs);
-
-    // --- Unpack outputs ---
-
-    torch::Tensor deformedPos, deformedScale, deformedRot, deformedOpacity;
-
-    if (outputs.isTuple()) {
-        auto tuple = outputs.toTuple();
-        deformedPos     = tuple->elements().at(0).toTensor();
-        deformedScale   = tuple->elements().at(1).toTensor();
-        deformedRot     = tuple->elements().at(2).toTensor();
-        deformedOpacity = tuple->elements().at(3).toTensor();
-    } else if (outputs.isTensor()) {
-        // Single tensor: assume concatenated [pos, scale, rot, opacity]
-        auto t = outputs.toTensor();
-        deformedPos     = t.slice(1, 0, 3);
-        deformedScale   = t.slice(1, 3, 6);
-        deformedRot     = t.slice(1, 6, 10);
-        deformedOpacity = t.slice(1, 10, 11);
-    } else {
-        println("SN4DGSSplats::runDeformation: unexpected output type");
+        // --- Unpack outputs ---
+        // We consume only position/scale/rotation. The model may also return an
+        // opacity tensor (4th element / cols 10:11), but Splatshop's render path
+        // reads opacity from GaussianData.color, which swapToDeformed() does not
+        // touch — so a deformed opacity would never be consumed. Ignoring it
+        // avoids allocating/copying a buffer that is never read.
+        if (outputs.isTuple()) {
+            auto tuple = outputs.toTuple();
+            deformedPos   = tuple->elements().at(0).toTensor();
+            deformedScale = tuple->elements().at(1).toTensor();
+            deformedRot   = tuple->elements().at(2).toTensor();
+        } else if (outputs.isTensor()) {
+            // Single tensor: assume concatenated [pos, scale, rot, (opacity)]
+            auto t = outputs.toTensor();
+            deformedPos   = t.slice(1, 0, 3);
+            deformedScale = t.slice(1, 3, 6);
+            deformedRot   = t.slice(1, 6, 10);
+        } else {
+            println("SN4DGSSplats::runDeformation: unexpected output type");
+            return;
+        }
+    } catch (const c10::Error& e) {
+        println("SN4DGSSplats '{}': deformation forward failed: {}", name, e.what());
+        return;
+    } catch (const std::exception& e) {
+        println("SN4DGSSplats '{}': deformation forward failed: {}", name, e.what());
         return;
     }
 
     // --- Copy outputs to deformation buffers ---
 
     // Ensure tensors are contiguous before copying
-    deformedPos     = deformedPos.contiguous();
-    deformedScale   = deformedScale.contiguous();
-    deformedRot     = deformedRot.contiguous();
-    deformedOpacity = deformedOpacity.contiguous();
+    deformedPos   = deformedPos.contiguous();
+    deformedScale = deformedScale.contiguous();
+    deformedRot   = deformedRot.contiguous();
 
     // Copy LibTorch tensor data to our CUDA buffers.
-    // We use cudaMemcpyAsync for explicit CUDA stream control.
-    size_t posBytes = N * 3 * sizeof(float);
+    // We use cuMemcpyDtoDAsync for explicit CUDA stream control — LibTorch
+    // tensors reside on the same CUDA device as Splatshop's deformBuffer.
+    size_t posBytes   = N * 3 * sizeof(float);
     size_t scaleBytes = N * 3 * sizeof(float);
-    size_t rotBytes = N * 4 * sizeof(float);
-    size_t opacityBytes = N * sizeof(float);
+    size_t rotBytes   = N * 4 * sizeof(float);
 
-    // cuMemcpyDtoDAsync allows D2D copies on the same device.
-    // LibTorch tensors reside on the same CUDA device as Splatshop.
     CURuntime::check(cuMemcpyDtoDAsync(
         deformBuffer.cptr_deformedPosition,
         reinterpret_cast<CUdeviceptr>(deformedPos.data_ptr<float>()),
@@ -257,11 +259,6 @@ void SN4DGSSplats::runDeformation(float time, CUstream stream) {
         deformBuffer.cptr_deformedRotation,
         reinterpret_cast<CUdeviceptr>(deformedRot.data_ptr<float>()),
         rotBytes, stream
-    ));
-    CURuntime::check(cuMemcpyDtoDAsync(
-        deformBuffer.cptr_deformedOpacity,
-        reinterpret_cast<CUdeviceptr>(deformedOpacity.data_ptr<float>()),
-        opacityBytes, stream
     ));
 }
 

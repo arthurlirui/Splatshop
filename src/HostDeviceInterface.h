@@ -701,6 +701,17 @@ inline vec3 hslToRgb(float H, float Sl, float L){
 
 inline vec4 applyColorCorrection(vec4 color, ColorCorrection colorCorrection){
 
+	// Fast path: a default-constructed ColorCorrection (all-zero offsets,
+	// gamma=1) is a no-op. Skip the brightness/contrast/gamma/HSL math -
+	// including the rgbToHSL + hslToRgb trig/exp - which is measurable on
+	// large point clouds where every unselected node is rendered with the
+	// default correction.
+	if(colorCorrection.brightness == 0.0f && colorCorrection.contrast == 0.0f &&
+	   colorCorrection.gamma == 1.0f && colorCorrection.hue == 0.0f &&
+	   colorCorrection.saturation == 0.0f && colorCorrection.lightness == 0.0f){
+		return color;
+	}
+
 	float r = color.r;
 	float g = color.g;
 	float b = color.b;

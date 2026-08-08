@@ -186,7 +186,7 @@ struct LasLoader{
 			double t_end = now();
 			double seconds = t_end - t_start;
 
-			println("loaded {:L} points in {:.3f} seconds.", points->numPointsLoaded, seconds);
+			println("loaded {:L} points in {:.3f} seconds.", points->numPointsLoaded.load(), seconds);
 		});
 
 		t.detach();

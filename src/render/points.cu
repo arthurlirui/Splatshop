@@ -361,11 +361,12 @@ void kernel_hqs_depth(
 
 extern "C" __global__
 void kernel_hqs_color(
-	CommonLaunchArgs args, PointData points, 
-	RenderTarget target, 
+	CommonLaunchArgs args, PointData points,
+	RenderTarget target,
 	uint32_t* fb_depth,
 	uint32_t* fb_colors,
-	float pointSize
+	float pointSize,
+	ColorCorrection colorCorrection
 ){
 	auto grid = cg::this_grid();
 	int index = grid.thread_rank();
@@ -380,11 +381,27 @@ void kernel_hqs_color(
 	bool isSelected = flags & FLAGS_SELECTED;
 	bool isErased = flags & FLAGS_DELETED;
 
-	if(isSelected){ 
+	if(isSelected){
 		// color = 0x000000ff;
 		rgba[0] = clamp(rgba[0] * 1.5f + 50.1f, 0.0f, 255.0f);
 	}
 	if(isErased) return;
+
+	// Apply the live color-correction settings (brightness/contrast/gamma/
+	// hue/saturation/lightness) to this point's color. The host passes the
+	// settings.colorCorrection values for selected nodes (mirrors the splat
+	// render-time preview path); for unselected nodes the host passes a
+	// default-constructed ColorCorrection, which applyColorCorrection leaves
+	// unchanged (brightness=0, contrast=0, gamma=1, hue=0, ...).
+	{
+		vec4 c = vec4(float(rgba[0]) / 255.0f,
+		              float(rgba[1]) / 255.0f,
+		              float(rgba[2]) / 255.0f, 1.0f);
+		c = applyColorCorrection(c, colorCorrection);
+		rgba[0] = (uint8_t)clamp(c.r * 255.0f, 0.0f, 255.0f);
+		rgba[1] = (uint8_t)clamp(c.g * 255.0f, 0.0f, 255.0f);
+		rgba[2] = (uint8_t)clamp(c.b * 255.0f, 0.0f, 255.0f);
+	}
 
 	mat4 transform = target.proj * target.view * points.transform;
 	vec4 ndc = transform * vec4(pos, 1.0f);

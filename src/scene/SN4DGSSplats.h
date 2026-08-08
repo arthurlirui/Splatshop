@@ -25,37 +25,64 @@
 #include <memory>
 #include <string>
 #include <atomic>
+#include <filesystem>
 
 #include "SNSplats.h"         // SceneNode (glm) + HostDeviceInterface.h + Splats.h
 #include "SplatsManagement.h"
 #include "CudaVirtualMemory.h"
 #include "CURuntime.h"
+#include "json/json.hpp"        // nlohmann::json — already a project dependency (SplatsyFilesLoader)
 
-// Forward declarations to avoid exposing LibTorch headers in this public header.
-// The actual LibTorch dependency is encapsulated in the .cpp file.
-namespace torch { namespace jit { namespace script { struct Module; } } }
+#ifdef SPLATSHOP_HAS_LIBTORCH
+#include <torch/script.h>       // torch::jit::script::Module
+#endif
 
 /// 4DGS deformation configuration parsed from config.json.
 struct Deform4DGSConfig {
     int shDegree = 3;
     int nGaussians = 0;
     std::string formatVersion = "1.0";
+
+    /// Load a Deform4DGSConfig from a config.json file written by
+    /// tools/export_4dgs_torchscript.py. Missing/unreadable files yield the
+    /// struct defaults above. Defined inline (header-only) so the import UI in
+    /// gui/motion.h can call it without pulling in the LibTorch-guarded .cpp.
+    static Deform4DGSConfig loadFromFile(const std::string& jsonPath) {
+        Deform4DGSConfig cfg;
+        namespace fs = std::filesystem;
+        if (jsonPath.empty() || !fs::exists(jsonPath)) {
+            return cfg;
+        }
+        try {
+            // readTextFile is from unsuck.hpp (already included transitively).
+            std::string text = readTextFile(jsonPath);
+            auto j = nlohmann::json::parse(text);
+            if (j.contains("sh_degree")     && j["sh_degree"].is_number_integer())     cfg.shDegree     = j["sh_degree"].get<int>();
+            if (j.contains("n_gaussians")   && j["n_gaussians"].is_number_integer())   cfg.nGaussians   = j["n_gaussians"].get<int>();
+            if (j.contains("format_version")&& j["format_version"].is_string())        cfg.formatVersion= j["format_version"].get<std::string>();
+        } catch (const std::exception& e) {
+            println("Deform4DGSConfig: could not parse '{}': {}; using defaults", jsonPath, e.what());
+        }
+        return cfg;
+    }
 };
 
 /// Device-backed deformation buffers for a SN4DGSSplats node.
 /// These hold the deformed output of the LibTorch forward pass
 /// and are read by the staging kernel instead of the canonical buffers.
 struct Deform4DGSBuffer {
-    // Deformed output (written by LibTorch, read by staging kernel)
+    // Deformed output (written by LibTorch, read by staging kernel).
+    // Opacity is intentionally NOT here: Splatshop stores opacity inside
+    // GaussianData.color (interleaved with rgb) and swapToDeformed() does not
+    // swap a separate opacity pointer, so a deformed opacity buffer would never
+    // be consumed. See SN4DGSSplats.cpp::runDeformation for the rationale.
     shared_ptr<CudaVirtualMemory> vm_deformedPosition  = nullptr;
     shared_ptr<CudaVirtualMemory> vm_deformedScale     = nullptr;
     shared_ptr<CudaVirtualMemory> vm_deformedRotation  = nullptr;
-    shared_ptr<CudaVirtualMemory> vm_deformedOpacity   = nullptr;
 
     CUdeviceptr cptr_deformedPosition = 0;
     CUdeviceptr cptr_deformedScale    = 0;
     CUdeviceptr cptr_deformedRotation = 0;
-    CUdeviceptr cptr_deformedOpacity  = 0;
 
     void allocDevice(int64_t numSplats);
     void freeDevice();
@@ -66,10 +93,12 @@ struct SN4DGSSplats : public SNSplats {
     Deform4DGSConfig deformConfig;
     Deform4DGSBuffer deformBuffer;
 
-    // The TorchScript deformation module. Wrapped in a unique_ptr so we
-    // can forward-declare torch::jit::script::Module and avoid exposing
-    // LibTorch headers to code that includes this header.
+    // The TorchScript deformation module. Loaded from deformation_model.pt.
+#ifdef SPLATSHOP_HAS_LIBTORCH
+    std::unique_ptr<torch::jit::script::Module> deformModule;
+#else
     std::unique_ptr<void, void(*)(void*)> deformModule;
+#endif
 
     // Current time (normalized, 0.0 to 1.0). The deformation is recomputed
     // whenever this changes or when canonical Gaussians are edited.
@@ -129,11 +158,6 @@ struct SN4DGSSplats : public SNSplats {
     /// Get the pointer to deformed rotation quaternions.
     vec4* getDeformedRotations() const {
         return reinterpret_cast<vec4*>(deformBuffer.cptr_deformedRotation);
-    }
-
-    /// Get the pointer to deformed opacities.
-    float* getDeformedOpacities() const {
-        return reinterpret_cast<float*>(deformBuffer.cptr_deformedOpacity);
     }
 
     // --- Overrides ---

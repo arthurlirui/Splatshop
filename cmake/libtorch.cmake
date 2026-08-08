@@ -49,7 +49,16 @@ function(ADD_LIBTORCH TARGET_NAME)
     endif()
 
     # ------------------------------------------------------------------
-    # 2. Fallback: try LIBTORCH_PATH environment variable
+    # 2. Fallback: check in-project location libs/libtorch
+    # ------------------------------------------------------------------
+    set(_project_libtorch "${CMAKE_SOURCE_DIR}/libs/libtorch")
+    if(NOT DEFINED LIBTORCH_PATH AND EXISTS "${_project_libtorch}/include")
+        set(LIBTORCH_PATH "${_project_libtorch}" CACHE PATH "LibTorch install directory")
+        message(STATUS "LibTorch auto-detected in project: ${LIBTORCH_PATH}")
+    endif()
+
+    # ------------------------------------------------------------------
+    # 3. Fallback: try LIBTORCH_PATH environment variable
     # ------------------------------------------------------------------
     if(NOT DEFINED LIBTORCH_PATH AND DEFINED ENV{LIBTORCH_PATH})
         set(LIBTORCH_PATH "$ENV{LIBTORCH_PATH}" CACHE PATH "LibTorch install directory")

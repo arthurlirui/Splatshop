@@ -110,7 +110,7 @@ struct BINPointCloudLoader {
 			}
 
 			double seconds = now() - tStart;
-			println("BINPointCloudLoader: loaded {:L} points in {:.3f}s", points->numPointsLoaded, seconds);
+			println("BINPointCloudLoader: loaded {:L} points in {:.3f}s", points->numPointsLoaded.load(), seconds);
 		});
 
 		t.detach();

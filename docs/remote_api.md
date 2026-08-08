@@ -211,6 +211,59 @@ curl http://localhost:8080/camera/pose
 
 ---
 
+### VR 远程立体浏览
+
+本组端点把一个**外部位姿源**（独立 VR 头显的浏览器 WebXR，或远端 SteamVR 客户端）接入渲染器的 `VIEWMODE_REMOTE_STEREO` 路径。头部位姿上行经控制通道（HTTP），渲染出的左右眼画面下行经**独立的视频通道**（WebSocket 帧服务器，默认 `:8081`），二者解耦。这是对“控制/视频分离”既有设计的扩展：远程浏览时首次内置了视频回传。
+
+**坐标系约定**（关键，最易出错）。`pose_space` 字段决定服务端如何处理位姿：
+
+| `pose_space` | 含义 | 服务端处理 |
+|---|---|---|
+| `"webxr"`（默认） | WebXR 视图矩阵（world→eye，+Y 上 / -Z 前，列主序） | 做基底变换 `B·view·B⁻¹` 转到应用 GL 空间（+Z 上 / +Y 前） |
+| `"openvr"` | OpenVR 跟踪空间位姿（+Y 上 / +Z 前） | 套用与本地沉浸式 VR 相同的 `flip` 并求逆：`view = inverse(flip·head·eye)` |
+| `"raw_view"` | 调用方已在应用 GL 空间（+Z 上 / +Y 前）提供最终视图矩阵 | 直接使用，不做任何变换 |
+
+所有矩阵均为 16 元素扁平数组，**列主序**（与 `glm::value_ptr` / `make_mat4` 一致，WebXR `viewMatrix`/`projectionMatrix` 天然满足）。
+
+| 方法 | 路径 | 请求体 | 说明 |
+|---|---|---|---|
+| POST | `/vr/enter` | - | 切换到 `VIEWMODE_REMOTE_STEREO`，停止本地 OpenVR（跳过 HMD 提交块） |
+| POST | `/vr/exit` | - | 返回桌面模式，停止接收远程位姿 |
+| POST | `/vr/pose` | 见下 | 高频位姿包（每帧一次），驱动左右眼视图/投影 |
+
+**`POST /vr/enter`** - 进入远程立体模式。
+```jsonc
+// data
+{"mode": "remote_stereo", "active": true}
+```
+
+**`POST /vr/pose`** - 高频位姿包。`webxr` 空间下提供 `view_left/right` + `proj_left/right`；`openvr` 空间下提供 `head_pose` + `eye_left/right` + 投影。`width/height` 设置每眼渲染目标分辨率。
+```jsonc
+// webxr 示例（省略 16 元素数组的具体数值）
+{
+  "pose_space": "webxr",
+  "view_left":  [...16...], "view_right": [...16...],
+  "proj_left":  [...16...], "proj_right": [...16...],
+  "width": 2048, "height": 2048
+}
+// data
+{"mode": "remote_stereo", "active": true, "width": 2048, "height": 2048}
+```
+
+**视频回传通道（WebSocket `:8081`）** - 浏览器连接 `ws://<host>:8081` 后，服务端按帧推送二进制消息，格式（小端序）：
+```
+u32 magic=0x56524653 | u16 sbsW | u16 sbsH | u16 eyeW | u16 eyeH | u16 codec | u32 len | u8 payload[len]
+```
+- `sbsW/sbsH`：左右并排合成图分辨率（`sbsW = 2·eyeW`）
+- `codec`：`0`=JPEG（默认，LAN 验证用，无需外部依赖）；`1`=H.264（需 NVENC，见下）
+- 客户端解码后，将左半图绘到左眼视口、右半图绘到右眼视口
+
+**编码后端**：默认 JPEG（`stb_image_write`，无外部依赖，适合 LAN 跑通端到端链路）。H.264 硬编（NVENC）为预留路径，需 NVIDIA Video Codec SDK 头文件 `nvEncodeAPI.h` + `nvencode.lib`（不随 CUDA 工具包分发），通过编译宏 `SPLATSHOP_HAS_NVENC` 启用，未提供时静默回退到 JPEG。
+
+**浏览器客户端**：`remote_api/examples/vr_webxr_client.html` 是开箱即用的 WebXR 客户端：读取 `getViewerPose().views` 的逐眼 `viewMatrix`/`projectionMatrix` 上行至 `/vr/pose`，同时接收 `:8081` 的 JPEG 帧并绘到 WebXR 层。需 HTTPS 或 localhost 提供（WebXR 安全上下文要求）。
+
+---
+
 ### 鼠标
 
 注入鼠标事件，驱动 `Runtime::controls` 与 `Runtime::mouseEvents`。坐标原点左上、Y 向下，桥接自动翻转。
@@ -428,6 +481,41 @@ curl -X POST http://localhost:8080/scene/splats/15/color \
 
 ---
 
+### 点云 Bundle Adjustment 优化
+
+通过可微高斯光栅化在 GPU 上精修点云的 **3D 位置 + 颜色**（范式 B，详见 `docs/ba_research.md`）。流程：把已加载的点云节点转换为 BA 节点 → 捕获当前视图作为光度目标 → 启动逐帧 AdamW 优化 → 优化后的位置/颜色实时写回渲染缓冲区。
+
+底层 C++ 桥接命令（点号命名，经 Python `server.py` 暴露为 REST 端点需自行补充路由）：
+
+| C++ 命令 | 作用 |
+|---|---|
+| `scene.points.ba.convert` | `{id}`：把一个 `SNPoints` 节点原地替换为 `SNPointCloudBA` 节点（复用 host `Points` 与 device 指针），返回新节点 id。 |
+| `scene.points.ba.capture` | `{id}`：把当前渲染帧缓冲（`virt_framebuffer`）回读为 HxWx3 RGB，连同桌面相机内参（由 `fovy`+`aspect`+视口推导）与 `view` 矩阵设为优化目标。 |
+| `scene.points.ba.start` | `{id, lr_position?, lr_color?, init_scale?, steps_per_frame?, max_steps?, optimize_position?, optimize_color?}`：按目标帧初始化优化器并开启逐帧优化。 |
+| `scene.points.ba.stop` | `{id}`：停止优化（已精修的点云保留）。 |
+| `scene.points.ba.reset` | `{id}`：丢弃优化状态。 |
+| `scene.points.ba.status` | `{id}`：返回 `{initialized, running, step, loss, loss_l1, loss_ssim, point_count, target_w, target_h, max_steps}`。 |
+
+调用示例（直接发 C++ 桥接 JSON）：
+
+```bash
+# 1. 转换点云节点 12 为 BA 节点
+printf '{"id":1,"cmd":"scene.points.ba.convert","args":{"id":12}}\n' | nc 127.0.0.1 7654
+
+# 2. 捕获当前视图为目标
+printf '{"id":2,"cmd":"scene.points.ba.capture","args":{"id":13}}\n' | nc 127.0.0.1 7654
+
+# 3. 启动优化（每帧 8 步，最多 2000 步）
+printf '{"id":3,"cmd":"scene.points.ba.start","args":{"id":13,"steps_per_frame":8,"max_steps":2000}}\n' | nc 127.0.0.1 7654
+
+# 4. 查询状态
+printf '{"id":4,"cmd":"scene.points.ba.status","args":{"id":13}}\n' | nc 127.0.0.1 7654
+```
+
+> 优化在主线程逐帧推进（`SplatEditor_update.h` 的 `forEach<SNPointCloudBA>`），与渲染共用 CUDA 主上下文；libtorch 缺失时（`!SPLATSHOP_HAS_LIBTORCH`）相关命令返回错误且模块编译为 stub。
+
+---
+
 ## 本地浏览器测试页（GET /test）
 
 服务内置一个自包含的测试控制页，用于在**本地浏览器**中验证鼠标/键盘/相机/刚体控制链路，无需任何 WebRTC 视频流。页面是纯 HTML/CSS/JS（无外部依赖），从同 origin 调用 API，因此没有 CORS 问题。
@@ -575,5 +663,9 @@ SPLAT_HTTP_PORT=9000 SPLAT_API_TOKEN=secret uvicorn remote_api.server:app --host
 - C++ 桥接：`src/remote/RemoteControlServer.h` / `.cpp`，`src/main.cpp`
 - Python API：`remote_api/`（`server.py`、`splat_client.py`、`models.py`、`keymap.py`、`config.py`）
 - 示例：`remote_api/examples/webrtc_receiver.py`
+- VR 远程浏览客户端：`remote_api/examples/vr_webxr_client.html`
+- VR 视频回传：`src/remote/FrameStreamer.h`、`src/remote/FrameStreamer.cpp`（WebSocket 帧服务器 + JPEG 编码）
+- VR 外部位姿路径：`src/common.h`（`VIEWMODE_REMOTE_STEREO`、`PoseSpace`）、`src/SplatEditor.h`（`RemoteStereoState`）、`src/SplatEditor_update.h`（位姿装配）、`src/SplatEditor_render.h`（双目渲染 + 帧捕获）
 - 底层：`include/OrbitControls.h`、`include/Runtime.h`、`include/MouseEvents.h`、`src/motion/MotionController.h`、`include/unsuck.hpp`（`EventQueue`）
 - Splats 创建：`include/Splats.h`、`src/scene/SNSplats.h`、`src/scene/SceneNode.h`、`src/loader/GSPlyLoader.h`、`src/SplatsManagement.h`（`GaussianDataManager`）
+- 点云 BA 优化：`src/optim/PointCloudBA.h`/`.cpp`（libtorch 可微高斯光栅化 + AdamW）、`src/scene/SNPointCloudBA.h`（场景节点）、`src/gui/pointcloud_ba.h`（GUI 面板）、`docs/ba_research.md`（算法调研）

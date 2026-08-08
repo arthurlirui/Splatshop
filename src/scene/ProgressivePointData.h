@@ -19,12 +19,20 @@
 // render state (reproject VBO, index image, indirect count) is cached in
 // SplatEditor_draw.h's ProgressiveTarget, mirroring ConcurrentTarget.
 
-#include <cmath>
 #include <cstdint>
+
+// The host-side owner (ProgressivePointCloud) needs <memory>, <vector>,
+// <cmath> and CudaVirtualMemory.h. NVRTC has no host standard library on its
+// include path and the .cu kernels only touch the POD ProgressivePointData
+// struct below, so guard all host-only dependencies. The ProgressivePointCloud
+// struct itself is also guarded further down.
+#ifndef __CUDACC__
+#include <cmath>
 #include <memory>
 #include <vector>
-
 #include "CudaVirtualMemory.h"
+#endif
+
 #include "HostDeviceInterface.h"
 
 // Matches Skye's MAX_POINTS_PER_BUFFER: the largest single GL buffer they
@@ -92,6 +100,7 @@ struct ProgressivePointData {
 // Host-side owner of the shuffled chunk buffers for one SNPoints node.
 // Allocates PROGRESSIVE_MAX_BUFFERS chunks up front (virtual memory is only
 // physically committed on demand), then commit()s enough to hold `count` points.
+#ifndef __CUDACC__
 struct ProgressivePointCloud {
 
 	shared_ptr<CudaVirtualMemory> vm_position[PROGRESSIVE_MAX_BUFFERS];
@@ -140,16 +149,26 @@ struct ProgressivePointCloud {
 		numBuffers = uint32_t((numPoints + PROGRESSIVE_MAX_POINTS_PER_BUFFER - 1) / PROGRESSIVE_MAX_POINTS_PER_BUFFER);
 		if (numBuffers == 0) numBuffers = 1;
 		if (numBuffers > PROGRESSIVE_MAX_BUFFERS) {
-			println("WARNING: progressive point cloud has {} points, needs {} buffers but only {} are supported; clamping.",
-				numPoints, numBuffers, PROGRESSIVE_MAX_BUFFERS);
+			// The kernels route a global index to chunk b = index / mpb and clamp
+			// b to numBuffers-1, but they do NOT recompute the local index — so
+			// any index beyond numBuffers*mpb would read/write past the last
+			// chunk. We therefore clamp `count` (and thus the prime and the fill
+			// range) to what the allocated buffers can actually hold, rather than
+			// only clamping numBuffers. This keeps the tail-chunk sizing below as
+			// well in range.
+			uint64_t maxSupported = uint64_t(PROGRESSIVE_MAX_BUFFERS) * PROGRESSIVE_MAX_POINTS_PER_BUFFER;
+			println("WARNING: progressive point cloud has {} points, needs {} buffers but only {} ({} points) are supported; clamping point count.",
+				numPoints, numBuffers, PROGRESSIVE_MAX_BUFFERS, maxSupported);
 			numBuffers = PROGRESSIVE_MAX_BUFFERS;
+			count = maxSupported;
+			numPoints = maxSupported;
 		}
 
-		prime = largestPrimeCongruent3mod4(numPoints);
+		prime = largestPrimeCongruent3mod4(count);
 
 		for (uint32_t i = 0; i < numBuffers; i++) {
 			uint64_t ptsThis = (i + 1 < numBuffers) ? PROGRESSIVE_MAX_POINTS_PER_BUFFER
-				: (numPoints - uint64_t(i) * PROGRESSIVE_MAX_POINTS_PER_BUFFER);
+				: (count - uint64_t(i) * PROGRESSIVE_MAX_POINTS_PER_BUFFER);
 
 			vm_position[i] = CudaVirtualMemory::create();
 			vm_color[i]    = CudaVirtualMemory::create();
@@ -161,7 +180,7 @@ struct ProgressivePointCloud {
 			data.color[i]    = (uint32_t*)vm_color[i]->cptr;
 		}
 
-		data.count        = uint32_t(numPoints);
+		data.count        = uint32_t(count);
 		data.numBuffers   = numBuffers;
 		data.maxPointsPerBuffer = PROGRESSIVE_MAX_POINTS_PER_BUFFER;
 		data.prime        = prime;
@@ -180,3 +199,4 @@ struct ProgressivePointCloud {
 		return usage;
 	}
 };
+#endif // __CUDACC__
