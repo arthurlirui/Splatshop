@@ -37,6 +37,37 @@ struct StreamCalibration {
 };
 
 // ---------------------------------------------------------------------------
+// Board pose (extrinsic) snapshot.
+//
+// The result of a single solvePnP solve: the chessboard's pose relative to
+// the camera. `rvec` is a Rodrigues rotation vector, `tvec` is the
+// translation in millimetres (squareSizeMm sets the unit), and `distanceMm`
+// is |tvec| - the ground-truth distance used to fit the depth correction.
+// ---------------------------------------------------------------------------
+struct ExtrinsicPose {
+    float rvec[3]      = {0.f, 0.f, 0.f};
+    float tvec[3]      = {0.f, 0.f, 0.f};
+    float distanceMm   = 0.f;
+    bool  valid        = false;
+};
+
+// ---------------------------------------------------------------------------
+// Depth metric correction.
+//
+// Linear fit over (ground-truth distance, depth reading) pairs collected at
+// different distances:  depth_true_mm = a * depth_measured_mm + b.
+// Corrects the camera's systematic metric scale/bias error. `valid` is set
+// after a successful fitDepthCorrection(); until then a=1, b=0 (identity).
+// ---------------------------------------------------------------------------
+struct DepthCorrection {
+    float  a           = 1.f;
+    float  b           = 0.f;
+    double rmsMm       = -1.0;     // RMS residual (mm), -1 until fitted
+    int    sampleCount = 0;
+    bool   valid       = false;
+};
+
+// ---------------------------------------------------------------------------
 // Whole-device calibration. The depth stream shares the IR stream's
 // distortion because the depth sensor and the IR projector/sensor are
 // physically co-located (the depth map is computed from the IR pattern).
@@ -49,6 +80,8 @@ struct DeviceCalibration {
     StreamCalibration depth;
     std::string   notes;
     std::string   filePath;                    // set after load/save
+    ExtrinsicPose     extrinsic;               // last solvePnP board pose
+    DepthCorrection   depthCorrection;         // linear depth metric fit
 };
 
 } // namespace orbbec
@@ -101,6 +134,37 @@ inline void from_json(const nlohmann::json& j, StreamCalibration& v) {
     v.valid                = j.value("valid", false);
 }
 
+inline void to_json(nlohmann::json& j, const ExtrinsicPose& v) {
+    j = nlohmann::json{{"rvec",      std::vector<float>{v.rvec[0], v.rvec[1], v.rvec[2]}},
+                       {"tvec",      std::vector<float>{v.tvec[0], v.tvec[1], v.tvec[2]}},
+                       {"distanceMm", v.distanceMm},
+                       {"valid",     v.valid}};
+}
+inline void from_json(const nlohmann::json& j, ExtrinsicPose& v) {
+    if (j.contains("rvec") && j.at("rvec").is_array()) {
+        const auto& a = j.at("rvec");
+        for (int i = 0; i < 3 && i < (int)a.size(); ++i) v.rvec[i] = a[i].get<float>();
+    }
+    if (j.contains("tvec") && j.at("tvec").is_array()) {
+        const auto& a = j.at("tvec");
+        for (int i = 0; i < 3 && i < (int)a.size(); ++i) v.tvec[i] = a[i].get<float>();
+    }
+    v.distanceMm = j.value("distanceMm", 0.f);
+    v.valid      = j.value("valid", false);
+}
+
+inline void to_json(nlohmann::json& j, const DepthCorrection& v) {
+    j = nlohmann::json{{"a", v.a}, {"b", v.b}, {"rmsMm", v.rmsMm},
+                       {"sampleCount", v.sampleCount}, {"valid", v.valid}};
+}
+inline void from_json(const nlohmann::json& j, DepthCorrection& v) {
+    v.a           = j.value("a", 1.f);
+    v.b           = j.value("b", 0.f);
+    v.rmsMm       = j.value("rmsMm", -1.0);
+    v.sampleCount = j.value("sampleCount", 0);
+    v.valid       = j.value("valid", false);
+}
+
 inline void to_json(nlohmann::json& j, const DeviceCalibration& v) {
     j = nlohmann::json{
         {"deviceSerial", v.deviceSerial},
@@ -108,7 +172,9 @@ inline void to_json(nlohmann::json& j, const DeviceCalibration& v) {
         {"color",        v.color},
         {"ir",           v.ir},
         {"depth",        v.depth},
-        {"notes",        v.notes}};
+        {"notes",        v.notes},
+        {"extrinsic",       v.extrinsic},
+        {"depthCorrection", v.depthCorrection}};
 }
 inline void from_json(const nlohmann::json& j, DeviceCalibration& v) {
     v.deviceSerial = j.value("deviceSerial", std::string{});
@@ -117,6 +183,157 @@ inline void from_json(const nlohmann::json& j, DeviceCalibration& v) {
     if (j.contains("ir"))    j.at("ir").get_to(v.ir);
     if (j.contains("depth")) j.at("depth").get_to(v.depth);
     v.notes = j.value("notes", std::string{});
+    if (j.contains("extrinsic"))       j.at("extrinsic").get_to(v.extrinsic);
+    if (j.contains("depthCorrection")) j.at("depthCorrection").get_to(v.depthCorrection);
+}
+
+// ---------------------------------------------------------------------------
+// CameraParams / StreamConfig / CameraParamsFile (de)serialisation.
+//
+// CameraParams holds the live device-control + depth-filter + point-cloud
+// settings; StreamConfig holds the per-stream resolution/fps/format. They are
+// persisted together in a CameraParamsFile so a device can be restored to a
+// known working configuration. AlignMode is stored as int so the file is
+// portable across builds with/without the OrbbecSDK.
+// ---------------------------------------------------------------------------
+inline void to_json(nlohmann::json& j, const StreamConfig& v) {
+    j = nlohmann::json{{"enable", v.enable}, {"width", v.width}, {"height", v.height},
+                       {"fps",    v.fps},    {"format", v.format}};
+}
+inline void from_json(const nlohmann::json& j, StreamConfig& v) {
+    v.enable = j.value("enable", true);
+    v.width  = j.value("width",  0);
+    v.height = j.value("height", 0);
+    v.fps    = j.value("fps",    0);
+    v.format = j.value("format", -1);
+}
+
+inline void to_json(nlohmann::json& j, const CameraParams& v) {
+    j = nlohmann::json{
+        // Color camera
+        {"colorAutoExposure",     v.colorAutoExposure},
+        {"colorExposure",         v.colorExposure},
+        {"colorGain",             v.colorGain},
+        {"colorAutoWhiteBalance", v.colorAutoWhiteBalance},
+        {"colorWhiteBalance",     v.colorWhiteBalance},
+        {"colorBrightness",       v.colorBrightness},
+        {"colorSaturation",       v.colorSaturation},
+        {"colorContrast",         v.colorContrast},
+        {"colorGamma",            v.colorGamma},
+        {"colorMirror",           v.colorMirror},
+        // Depth camera
+        {"depthAutoExposure",     v.depthAutoExposure},
+        {"depthExposure",         v.depthExposure},
+        {"depthGain",             v.depthGain},
+        {"depthPrecisionLevel",   v.depthPrecisionLevel},
+        {"depthMirror",           v.depthMirror},
+        {"minDepth",              v.minDepth},
+        {"maxDepth",              v.maxDepth},
+        // IR / Laser / LDP
+        {"irExposure",            v.irExposure},
+        {"irGain",                v.irGain},
+        {"laserOn",               v.laserOn},
+        {"ldpOn",                 v.ldpOn},
+        // Alignment / sync
+        {"alignMode",             static_cast<int>(v.alignMode)},
+        {"frameSync",             v.frameSync},
+        {"aggregateAllRequired",  v.aggregateAllRequired},
+        // Depth denoising
+        {"hwNoiseRemovalEnabled", v.hwNoiseRemovalEnabled},
+        {"hwNoiseMaxLut",         v.hwNoiseMaxLut},
+        {"hwNoiseMinDiff",        v.hwNoiseMinDiff},
+        {"denoiseFilterEnabled",  v.denoiseFilterEnabled},
+        {"denoiseMaxSize",        v.denoiseMaxSize},
+        {"denoiseDispDiff",       v.denoiseDispDiff},
+        {"spatialFilterEnabled",  v.spatialFilterEnabled},
+        {"spatialAlpha",          v.spatialAlpha},
+        {"spatialRadius",         v.spatialRadius},
+        {"spatialMagnitude",      v.spatialMagnitude},
+        {"spatialDispDiff",       v.spatialDispDiff},
+        {"temporalFilterEnabled", v.temporalFilterEnabled},
+        {"temporalWeight",        v.temporalWeight},
+        {"temporalDiffScale",     v.temporalDiffScale},
+        // Point cloud
+        {"pointCloudUseDenoisedDepth", v.pointCloudUseDenoisedDepth},
+        {"pointCloudAlignMode",   static_cast<int>(v.pointCloudAlignMode)},
+        // Depth distance filter
+        {"depthDistFilterEnabled", v.depthDistFilterEnabled},
+        {"depthDistMinMm",        v.depthDistMinMm},
+        {"depthDistMaxMm",        v.depthDistMaxMm}};
+}
+inline void from_json(const nlohmann::json& j, CameraParams& v) {
+    v.colorAutoExposure     = j.value("colorAutoExposure",     true);
+    v.colorExposure         = j.value("colorExposure",         -1);
+    v.colorGain             = j.value("colorGain",             -1);
+    v.colorAutoWhiteBalance = j.value("colorAutoWhiteBalance", true);
+    v.colorWhiteBalance     = j.value("colorWhiteBalance",     -1);
+    v.colorBrightness       = j.value("colorBrightness",       -1);
+    v.colorSaturation       = j.value("colorSaturation",       -1);
+    v.colorContrast         = j.value("colorContrast",         -1);
+    v.colorGamma            = j.value("colorGamma",            -1);
+    v.colorMirror           = j.value("colorMirror",           false);
+    v.depthAutoExposure     = j.value("depthAutoExposure",     true);
+    v.depthExposure         = j.value("depthExposure",         -1);
+    v.depthGain             = j.value("depthGain",             -1);
+    v.depthPrecisionLevel   = j.value("depthPrecisionLevel",   -1);
+    v.depthMirror           = j.value("depthMirror",           false);
+    v.minDepth              = j.value("minDepth",              -1);
+    v.maxDepth              = j.value("maxDepth",              -1);
+    v.irExposure            = j.value("irExposure",            -1);
+    v.irGain                = j.value("irGain",                -1);
+    v.laserOn               = j.value("laserOn",               true);
+    v.ldpOn                 = j.value("ldpOn",                 false);
+    v.alignMode             = static_cast<AlignMode>(j.value("alignMode", 0));
+    v.frameSync             = j.value("frameSync",             true);
+    v.aggregateAllRequired  = j.value("aggregateAllRequired",  true);
+    v.hwNoiseRemovalEnabled = j.value("hwNoiseRemovalEnabled", false);
+    v.hwNoiseMaxLut         = j.value("hwNoiseMaxLut",         -1);
+    v.hwNoiseMinDiff        = j.value("hwNoiseMinDiff",        -1);
+    v.denoiseFilterEnabled  = j.value("denoiseFilterEnabled",  false);
+    v.denoiseMaxSize        = j.value("denoiseMaxSize",        -1);
+    v.denoiseDispDiff       = j.value("denoiseDispDiff",       -1);
+    v.spatialFilterEnabled  = j.value("spatialFilterEnabled",  false);
+    v.spatialAlpha          = j.value("spatialAlpha",          -1.f);
+    v.spatialRadius         = j.value("spatialRadius",         -1);
+    v.spatialMagnitude      = j.value("spatialMagnitude",      -1);
+    v.spatialDispDiff       = j.value("spatialDispDiff",       -1);
+    v.temporalFilterEnabled = j.value("temporalFilterEnabled", false);
+    v.temporalWeight        = j.value("temporalWeight",        -1.f);
+    v.temporalDiffScale     = j.value("temporalDiffScale",     -1.f);
+    v.pointCloudUseDenoisedDepth = j.value("pointCloudUseDenoisedDepth", true);
+    v.pointCloudAlignMode   = static_cast<AlignMode>(j.value("pointCloudAlignMode", 3));
+    v.depthDistFilterEnabled = j.value("depthDistFilterEnabled", false);
+    v.depthDistMinMm        = j.value("depthDistMinMm",        300.0f);
+    v.depthDistMaxMm        = j.value("depthDistMaxMm",        5000.0f);
+}
+
+// On-disk container for a device's camera parameters + stream config.
+struct CameraParamsFile {
+    std::string   deviceSerial;
+    std::string   deviceName;
+    CameraParams  params;
+    StreamConfig  colorCfg;
+    StreamConfig  depthCfg;
+    std::string   timestamp;   // ISO-8601 of when it was saved
+    std::string   filePath;    // set after load/save
+};
+
+inline void to_json(nlohmann::json& j, const CameraParamsFile& v) {
+    j = nlohmann::json{
+        {"deviceSerial", v.deviceSerial},
+        {"deviceName",   v.deviceName},
+        {"params",       v.params},
+        {"colorCfg",     v.colorCfg},
+        {"depthCfg",     v.depthCfg},
+        {"timestamp",    v.timestamp}};
+}
+inline void from_json(const nlohmann::json& j, CameraParamsFile& v) {
+    v.deviceSerial = j.value("deviceSerial", std::string{});
+    v.deviceName   = j.value("deviceName",   std::string{});
+    if (j.contains("params"))   j.at("params").get_to(v.params);
+    if (j.contains("colorCfg")) j.at("colorCfg").get_to(v.colorCfg);
+    if (j.contains("depthCfg")) j.at("depthCfg").get_to(v.depthCfg);
+    v.timestamp    = j.value("timestamp",    std::string{});
 }
 
 } // namespace orbbec

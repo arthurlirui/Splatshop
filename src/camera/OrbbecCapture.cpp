@@ -67,10 +67,13 @@ struct OrbbecCapture::Impl {
     // Filters (created on demand).
     // `frameAlign` aligns the raw color/depth frames (D2C SW / C2D SW);
     // `align` + `pointCloud` are for the point-cloud path (always D2C).
+    // `alignC2D` is the point-cloud path's C2D aligner (color onto depth
+    // resolution), selected when params.pointCloudAlignMode == C2D.
     // `noiseRemoval` / `spatialFilter` / `temporalFilter` are depth
     // denoising post-processing filters applied after alignment.
     std::shared_ptr<ob::Align>            frameAlign;
     std::shared_ptr<ob::Align>            align;
+    std::shared_ptr<ob::Align>            alignC2D;
     std::shared_ptr<ob::PointCloudFilter> pointCloud;
     std::shared_ptr<ob::NoiseRemovalFilter>    noiseRemoval;
     std::shared_ptr<ob::LutNoiseRemovalFilter> hwNoiseRemoval;
@@ -204,6 +207,7 @@ void OrbbecCapture::close() {
     stop();
     impl->frameAlign.reset();
     impl->align.reset();
+    impl->alignC2D.reset();
     impl->pointCloud.reset();
     impl->noiseRemoval.reset();
     impl->hwNoiseRemoval.reset();
@@ -369,15 +373,22 @@ bool OrbbecCapture::start() {
         impl->intrinsicsReady.store(false);
 
         // (Re)create the point-cloud filter if requested. The point-cloud
-        // path always aligns depth to color (OB_STREAM_COLOR) regardless of
-        // the user's alignMode, because the RGB point cloud needs color and
-        // depth in the same coordinate system.
+        // path uses one of two aligners depending on
+        // params.pointCloudAlignMode:
+        //   - D2C (OB_STREAM_COLOR): depth warped onto the color frame's
+        //     resolution (legacy path).
+        //   - C2D (OB_STREAM_DEPTH): color warped onto the depth frame's
+        //     resolution, so the cloud is generated at depth resolution.
         if (impl->pointCloudEnabled) {
             impl->align = std::make_shared<ob::Align>(OB_STREAM_COLOR);
+            impl->align->setMatchTargetResolution(true);
+            impl->alignC2D = std::make_shared<ob::Align>(OB_STREAM_DEPTH);
+            impl->alignC2D->setMatchTargetResolution(true);
             impl->pointCloud = std::make_shared<ob::PointCloudFilter>();
             impl->pointCloud->setCreatePointFormat(OB_FORMAT_RGB_POINT);
         } else {
             impl->align.reset();
+            impl->alignC2D.reset();
             impl->pointCloud.reset();
         }
 
@@ -550,6 +561,45 @@ void OrbbecCapture::captureLoop() {
             }
         }
 
+        // Host-side distance filter: zero out depth pixels whose distance
+        // (pixel * depthScale, in mm) is outside [minMm, maxMm]. Runs after
+        // the SDK denoising filters so it also affects the point-cloud path
+        // (which feeds on `depthFrame`). The SDK frame buffer is read-only,
+        // so we wrap a clamped copy in a new OB_FRAME_DEPTH frame.
+        if (depthFrame && impl->params.depthDistFilterEnabled) {
+            auto df = depthFrame->as<ob::DepthFrame>();
+            if (df) {
+                uint32_t dw = df->getWidth();
+                uint32_t dh = df->getHeight();
+                uint32_t dsz = df->getDataSize();
+                const uint8_t* dptr = df->getData();
+                float dscale = df->getValueScale();
+                OBFormat dfmt = df->getFormat();
+                if (dw > 0 && dh > 0 && dsz > 0 && dptr != nullptr && dscale > 0.f) {
+                    auto dbuf = std::make_shared<Buffer>((int64_t)dsz);
+                    std::memcpy(dbuf->data, dptr, dsz);
+                    auto* px = reinterpret_cast<uint16_t*>(dbuf->data);
+                    int64_t n = (int64_t)dsz / (int64_t)sizeof(uint16_t);
+                    float minMm = impl->params.depthDistMinMm;
+                    float maxMm = impl->params.depthDistMaxMm;
+                    for (int64_t i = 0; i < n; ++i) {
+                        float mm = (float)px[i] * dscale;
+                        if (mm < minMm || mm > maxMm) px[i] = 0;
+                    }
+                    // Keep the Buffer alive until the SDK releases the frame.
+                    auto dbufKeep = std::make_shared<std::shared_ptr<Buffer>>(dbuf);
+                    auto newDepth = ob::FrameFactory::createVideoFrameFromBuffer(
+                        OB_FRAME_DEPTH, dfmt, dw, dh,
+                        (uint8_t*)dbuf->data,
+                        [dbufKeep](uint8_t*) { dbufKeep->reset(); },
+                        dsz, dw * sizeof(uint16_t));
+                    auto newDepthDf = newDepth->as<ob::DepthFrame>();
+                    newDepthDf->setValueScale(dscale);
+                    depthFrame = newDepthDf;
+                }
+            }
+        }
+
         // Build the RGBD snapshot.
         auto frame = std::make_shared<RGBDFrame>();
 
@@ -656,11 +706,61 @@ void OrbbecCapture::captureLoop() {
         }
 
         // Optional point cloud.
+        //
+        // The cloud can be generated from either:
+        //   - the raw frameset (legacy D2C path), or
+        //   - a freshly assembled frameset that carries the *denoised* depth
+        //     frame produced by the filters above (params.pointCloudUseDenoisedDepth).
+        // The alignment direction is chosen by params.pointCloudAlignMode:
+        //   - D2C (OB_STREAM_COLOR): depth warped onto the color resolution.
+        //   - C2D (OB_STREAM_DEPTH): color warped onto the depth resolution,
+        //     so the cloud lives in the depth sensor's coordinate system.
         std::shared_ptr<RGBDFrame> pcFrame;
-        if (impl->pointCloudEnabled && impl->align && impl->pointCloud &&
+        auto useC2D = static_cast<OBAlignMode>(impl->params.pointCloudAlignMode)
+                      == ALIGN_C2D_SW_MODE;
+        auto& pcAlign = useC2D ? impl->alignC2D : impl->align;
+        if (impl->pointCloudEnabled && pcAlign && impl->pointCloud &&
             colorFrame && depthFrame) {
             try {
-                auto aligned = impl->align->process(frameSet);
+                std::shared_ptr<ob::FrameSet> pcInput = frameSet;
+                if (impl->params.pointCloudUseDenoisedDepth) {
+                    // Wrap the denoised depth buffer in a new OB_FRAME_DEPTH
+                    // video frame and assemble a fresh frameset with it + the
+                    // original color frame. The PointCloudFilter / Align then
+                    // operate on the denoised depth instead of the raw one.
+                    auto df = depthFrame->as<ob::DepthFrame>();
+                    if (df) {
+                        uint32_t dw = df->getWidth();
+                        uint32_t dh = df->getHeight();
+                        uint32_t dsz = df->getDataSize();
+                        const uint8_t* dptr = df->getData();
+                        float dscale = df->getValueScale();
+                        OBFormat dfmt = df->getFormat();
+                        if (dw > 0 && dh > 0 && dsz > 0 && dptr != nullptr) {
+                            // Copy the depth buffer into a host-owned Buffer
+                            // whose lifetime outlives the frame; the SDK frame
+                            // holds the raw pointer until it is destroyed.
+                            auto dbuf = std::make_shared<Buffer>((int64_t)dsz);
+                            std::memcpy(dbuf->data, dptr, dsz);
+                            // Keep the Buffer alive until the SDK releases the
+                            // frame via the destroy callback.
+                            auto dbufKeep = std::make_shared<std::shared_ptr<Buffer>>(dbuf);
+                            auto newDepth = ob::FrameFactory::createVideoFrameFromBuffer(
+                                OB_FRAME_DEPTH, dfmt, dw, dh,
+                                (uint8_t*)dbuf->data,
+                                [dbufKeep](uint8_t*) { dbufKeep->reset(); },
+                                dsz, dw * sizeof(uint16_t));
+                            newDepth->as<ob::DepthFrame>()->setValueScale(dscale);
+
+                            auto newSet = ob::FrameFactory::createFrameSet();
+                            newSet->pushFrame(newDepth);
+                            if (colorFrame) newSet->pushFrame(colorFrame);
+                            pcInput = newSet;
+                        }
+                    }
+                }
+
+                auto aligned = pcAlign->process(pcInput);
                 auto pcFrameRaw = impl->pointCloud->process(aligned);
                 if (pcFrameRaw) {
                     uint32_t sz = pcFrameRaw->getDataSize();

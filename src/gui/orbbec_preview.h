@@ -164,6 +164,10 @@ void SplatEditor::makeOrbbecPreviewGUI() {
 		ImGui::SetNextItemWidth(110);
 		const char* undistModes[] = { "Undistort: Off", "Undistort: On", "Undistort: Compare" };
 		ImGui::Combo("##undistmode", &settings.orbbecUndistortMode, undistModes, IM_ARRAYSIZE(undistModes));
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(110);
+		const char* dcorModes[] = { "DepthCorrect: Off", "DepthCorrect: On" };
+		ImGui::Combo("##dcormode", &settings.orbbecDepthCorrectMode, dcorModes, IM_ARRAYSIZE(dcorModes));
 #endif
 
 		ImGui::Separator();
@@ -441,6 +445,29 @@ void SplatEditor::makeOrbbecPreviewGUI() {
 					}
 				}
 #endif
+#if defined(SPLATSHOP_HAS_OPENCV)
+				// Depth metric correction (depth' = a*depth + b). Applied after
+				// lens undistortion and before the colormap pass. Invalid
+				// pixels (0) are preserved. Gated by settings.orbbecDepthCorrectMode
+				// (1 = on) and a valid DepthCorrection fit. The result is written
+				// into a per-editor uint16 buffer so the raw/undistorted renders
+				// in compare mode don't clobber each other's storage.
+				if (settings.orbbecDepthCorrectMode >= 1 &&
+				    editor->orbbecActiveCalibration.depthCorrection.valid) {
+					float ca = editor->orbbecActiveCalibration.depthCorrection.a;
+					float cb = editor->orbbecActiveCalibration.depthCorrection.b;
+					editor->orbbecDepthCorrected16.resize((size_t)pixCount);
+					for (int64_t i = 0; i < pixCount; ++i) {
+						uint16_t d = depth16[i];
+						if (d == 0) { editor->orbbecDepthCorrected16[i] = 0; continue; }
+						float mm = (float)d * scale;
+						float corrected = ca * mm + cb;
+						if (corrected <= 0.f) { editor->orbbecDepthCorrected16[i] = 0; continue; }
+						editor->orbbecDepthCorrected16[i] = (uint16_t)(corrected / scale + 0.5f);
+					}
+					depth16 = editor->orbbecDepthCorrected16.data();
+				}
+#endif
 				uint8_t* dst = scratch.data();
 				const uint8_t* lut = editor->orbbecDepthLUT.data();
 				float maxMm = settings.orbbecDepthMaxMeters * 1000.f;
@@ -636,7 +663,7 @@ void SplatEditor::makeOrbbecPointCloudGUI() {
 			return;
 		}
 
-		// --- 3D image ---
+		// --- 3D image + orbit/pan/zoom interaction ---
 		GLuint tex = editor->orbbecTexPointCloud;
 		int texW = editor->orbbecTexPointCloudW;
 		int texH = editor->orbbecTexPointCloudH;
@@ -653,28 +680,142 @@ void SplatEditor::makeOrbbecPointCloudGUI() {
 		float scale = std::min(availW / drawW, availH / drawH);
 		if (scale < 1.0f) { drawW *= scale; drawH *= scale; }
 
-		// Capture mouse input over the image for the self-contained orbit
-		// camera. Drag = rotate yaw/pitch, wheel = zoom radius.
+		// Draw the rendered cloud, then handle input over the image region.
+		// The interaction is a self-contained orbit camera independent of
+		// GLRenderer::camera / OrbitControls so it never disturbs the main
+		// viewport. A down/up state machine (rather than IsMouseDragging)
+		// fixes the "stuck dragging" bug where the cursor leaves the panel
+		// while a button is held: we only start a drag on a click *inside*
+		// the image, and we always stop it on the matching release no matter
+		// where the cursor is.
 		ImGui::Image((ImTextureID)(void*)(intptr_t)tex, ImVec2(drawW, drawH));
 		bool hovered = ImGui::IsItemHovered();
+		ImVec2 mousePos = ImGui::GetIO().MousePos;
 
-		if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-			ImVec2 delta = ImGui::GetIO().MouseDelta;
-			node->pcYaw   -= delta.x / 300.0f;
-			node->pcPitch += delta.y / 300.0f;
-			node->pcPitch = std::clamp(node->pcPitch, -1.5534f, 1.5534f);
-			settings.orbbecPCAutoFit = false; // user took manual control
+		// --- Button down: start a drag only when the click began on the image. ---
+		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			node->pcRotating = true;
+			node->pcLastMouseX = mousePos.x;
+			node->pcLastMouseY = mousePos.y;
+			settings.orbbecPCAutoFit = false;
 		}
+		if (hovered && (ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
+		                ImGui::IsMouseClicked(ImGuiMouseButton_Middle))) {
+			node->pcPanning = true;
+			node->pcLastMouseX = mousePos.x;
+			node->pcLastMouseY = mousePos.y;
+			settings.orbbecPCAutoFit = false;
+		}
+
+		// --- Rotate (left drag). ---
+		if (node->pcRotating) {
+			float dx = mousePos.x - node->pcLastMouseX;
+			float dy = mousePos.y - node->pcLastMouseY;
+			node->pcYaw   -= dx / 200.0f;
+			node->pcPitch += dy / 200.0f;
+			// Clamp pitch just shy of ±90° to avoid the gimbal flip.
+			node->pcPitch = std::clamp(node->pcPitch,
+			                           -1.5707f, 1.5707f);
+			node->pcLastMouseX = mousePos.x;
+			node->pcLastMouseY = mousePos.y;
+		}
+		// --- Pan (right/middle drag), in screen plane, scaled by radius. ---
+		if (node->pcPanning) {
+			float dx = mousePos.x - node->pcLastMouseX;
+			float dy = mousePos.y - node->pcLastMouseY;
+			// Build the camera's right/up basis from the current yaw/pitch so
+			// the pan tracks the screen axes (mirrors OrbitControls).
+			glm::vec3 up(0.0f, 0.0f, 1.0f);
+			glm::vec3 right(1.0f, 0.0f, 0.0f);
+			glm::mat4 rotYaw = glm::rotate(node->pcYaw, up);
+			glm::mat4 rotPitch = glm::rotate(node->pcPitch, right);
+			glm::mat4 flip(1.0f, 0.0f, 0.0f, 0.0f,
+			               0.0f, 0.0f, 1.0f, 0.0f,
+			               0.0f, -1.0f, 0.0f, 0.0f,
+			               0.0f, 0.0f, 0.0f, 1.0f);
+			glm::mat4 rot = rotYaw * rotPitch * flip;
+			glm::vec3 camRight = glm::vec3(rot * glm::vec4(1, 0, 0, 0));
+			glm::vec3 camUp    = glm::vec3(rot * glm::vec4(0, 1, 0, 0));
+			float panScale = node->pcRadius * 0.0015f;
+			node->pcTarget -= camRight * (dx * panScale);
+			node->pcTarget += camUp    * (dy * panScale);
+			node->pcLastMouseX = mousePos.x;
+			node->pcLastMouseY = mousePos.y;
+		}
+
+		// --- Button up: always end the drag (even if the cursor left the panel). ---
+		if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))   node->pcRotating = false;
+		if (ImGui::IsMouseReleased(ImGuiMouseButton_Right) ||
+		    ImGui::IsMouseReleased(ImGuiMouseButton_Middle)) node->pcPanning = false;
+
+		// --- Wheel zoom (only when over the image). ---
 		if (hovered && ImGui::GetIO().MouseWheel != 0.0f) {
 			float w = ImGui::GetIO().MouseWheel;
 			node->pcRadius *= (w > 0) ? (1.0f / 1.1f) : 1.1f;
-			node->pcRadius = std::clamp(node->pcRadius, 0.05f, 100.0f);
+			node->pcRadius = std::clamp(node->pcRadius, 0.02f, 200.0f);
 			settings.orbbecPCAutoFit = false;
+		}
+
+		// --- Keyboard controls (only when the image is hovered, so they
+		//     never leak into the main viewport). ---
+		if (hovered && !ImGui::GetIO().WantTextInput) {
+			auto down = [](int k) { return ImGui::IsKeyDown(k); };
+			float rotStep = 0.03f;
+			float panStep = node->pcRadius * 0.03f;
+			float zoomStep = 1.0f / 1.1f;
+
+			// Rotate with WASD / arrows. GLFW key codes (letters: 'A'=65..).
+			bool kA = down(65), kD = down(68), kW = down(87), kS = down(83);
+			bool kLeft = down(ImGuiKey_LeftArrow), kRight = down(ImGuiKey_RightArrow);
+			bool kUp = down(ImGuiKey_UpArrow), kDown = down(ImGuiKey_DownArrow);
+			if (kLeft || kA)  node->pcYaw   += rotStep;
+			if (kRight || kD) node->pcYaw   -= rotStep;
+			if (kUp || kW)    node->pcPitch -= rotStep;
+			if (kDown || kS)  node->pcPitch += rotStep;
+			node->pcPitch = std::clamp(node->pcPitch, -1.5707f, 1.5707f);
+
+			// Pan with Q/E (vertical), scaled by current radius.
+			glm::vec3 up(0.0f, 0.0f, 1.0f);
+			glm::vec3 right(1.0f, 0.0f, 0.0f);
+			glm::mat4 rotYaw = glm::rotate(node->pcYaw, up);
+			glm::mat4 rotPitch = glm::rotate(node->pcPitch, right);
+			glm::mat4 flip(1.0f, 0.0f, 0.0f, 0.0f,
+			               0.0f, 0.0f, 1.0f, 0.0f,
+			               0.0f, -1.0f, 0.0f, 0.0f,
+			               0.0f, 0.0f, 0.0f, 1.0f);
+			glm::mat4 rot = rotYaw * rotPitch * flip;
+			glm::vec3 camUp = glm::vec3(rot * glm::vec4(0, 1, 0, 0));
+			bool kQ = down(81), kE = down(69);
+			if (kQ) node->pcTarget += camUp * panStep;
+			if (kE) node->pcTarget -= camUp * panStep;
+
+			// +/- zoom.
+			bool kPlus  = down(61) || down(334);  // '=' or keypad '+'
+			bool kMinus = down(45) || down(333);  // '-' or keypad '-'
+			if (kPlus)  node->pcRadius *= zoomStep;
+			if (kMinus) node->pcRadius /= zoomStep;
+			node->pcRadius = std::clamp(node->pcRadius, 0.02f, 200.0f);
+
+			// R: reset view (re-trigger auto-fit on the next frame).
+			if (ImGui::IsKeyPressed(82)) {            // 'R'
+				node->pcYaw = 0.0f;
+				node->pcPitch = 0.0f;
+				node->pcCameraInited = false;
+				settings.orbbecPCAutoFit = true;
+			}
+			// Space: toggle pause/resume.
+			if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
+				settings.orbbecPCPaused = !settings.orbbecPCPaused;
+			}
+			if (kA || kD || kW || kS || kLeft || kRight || kUp || kDown ||
+			    kQ || kE || kPlus || kMinus) {
+				settings.orbbecPCAutoFit = false;
+			}
 		}
 
 		// --- Status line ---
 		PointData& pd = node->manager.data;
-		ImGui::Text("points: %u   size: %.2fx%.2fx%.2f m   tex: %dx%d",
+		ImGui::Text("points: %u   size: %.2fx%.2fx%.2f m   tex: %dx%d   [L-drag rotate | R/M-drag pan | wheel zoom | WASD/QE | R reset]",
 		            pd.count,
 		            pd.max.x - pd.min.x, pd.max.y - pd.min.y, pd.max.z - pd.min.z,
 		            texW, texH);

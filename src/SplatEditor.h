@@ -32,6 +32,7 @@
 #ifdef SPLATSHOP_HAS_OPENCV
 #include "Calibration.h"
 #include "./calibration/Calibrator.h"
+#include "./calibration/ExtrinsicCalibrator.h"
 #include "./calibration/CalibrationStore.h"
 #endif
 
@@ -147,6 +148,8 @@ struct SplatEditor{
 	vector<orbbec::StreamConfig> orbbecDepthProfiles;
 	int orbbecColorProfileIdx = 0;
 	int orbbecDepthProfileIdx = 0;
+	// Last Save/Load Params result message shown in the Orbbec panel.
+	string orbbecParamsSaveMsg;
 
 	// --- Orbbec real-time preview (RGB + Depth textures in ImGui) ---
 	GLuint orbbecTexColor = 0;
@@ -195,6 +198,18 @@ struct SplatEditor{
 	int orbbecCalibTargetStream = 0;  // 0=Color 1=IR 2=Depth
 	std::string orbbecCalibSavePath;
 	std::string orbbecCalibLoadPath;
+
+	// --- Orbbec extrinsic (solvePnP) + depth correction (runtime state) ---
+	// ExtrinsicCalibrator engine + overlay texture for the live detection
+	// preview. The solved pose + depth-correction fit live on
+	// orbbecActiveCalibration (ExtrinsicPose / DepthCorrection). Depends on
+	// OpenCV, so guarded by SPLATSHOP_HAS_OPENCV.
+	std::shared_ptr<orbbec::ExtrinsicCalibrator> orbbecExtCalibrator;
+	GLuint orbbecPnPTexOverlay = 0;
+	int    orbbecPnPTexOverlayW = 0, orbbecPnPTexOverlayH = 0;
+	std::vector<uint8_t> orbbecPnPOverlayScratch;   // BGR8 overlay buffer
+	std::vector<uint16_t> orbbecDepthCorrected16;   // corrected uint16 depth (pre-colormap)
+	bool orbbecPnPUseCalibIntrinsics = true;        // use calibrated IR intrinsics for solvePnP
 #endif
 #endif
 
@@ -450,6 +465,10 @@ struct SplatEditor{
 	// 0 = off (show raw), 1 = on (show undistorted), 2 = compare (side-by-side).
 	int  orbbecUndistortMode = 0;
 	bool orbbecUseCalibratedIntrinsics = false; // use calibrated intrinsics for point cloud
+	// Orbbec extrinsic (solvePnP) + depth correction panel + preview toggle.
+	bool showOrbbecPnP = false;          // extrinsic PnP + depth correction panel
+	// 0 = off (show raw depth), 1 = on (apply a*depth+b in the preview).
+	int  orbbecDepthCorrectMode = 0;
 #endif
 #ifdef SPLATSHOP_HAS_K4A
 	bool showK4a = false;                  // K4A Wrapper camera control panel
@@ -623,6 +642,7 @@ struct SplatEditor{
 	void makeOrbbecPreviewGUI();
 	void makeOrbbecPointCloudGUI();
 	void makeOrbbecCalibrationGUI();
+	void makeOrbbecPnPGUI();
 
 	// K4A Wrapper panel methods (stubs when SPLATSHOP_HAS_K4A is undefined).
 	void makeK4aGUI();

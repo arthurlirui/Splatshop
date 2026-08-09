@@ -13,6 +13,7 @@
 
 #ifdef SPLATSHOP_HAS_ORBBEC
 #include <algorithm>
+#include <ctime>
 #include "../camera/OrbbecCapture.h"
 #include "../scene/SNOrbbec.h"
 
@@ -297,6 +298,22 @@ void SplatEditor::makeOrbbecGUI(){
 				ImGui::Unindent();
 			}
 
+			// --- Distance Filter (host-side pixel clamp, post-denoise) ---
+			ImGui::Separator();
+			changed |= ImGui::Checkbox("Distance Filter", &p.depthDistFilterEnabled);
+			if(p.depthDistFilterEnabled){
+				ImGui::Indent();
+				changed |= ImGui::SliderFloat("Min distance (mm)", &p.depthDistMinMm,
+				                              0.f, 10000.f, "%.0f");
+				changed |= ImGui::SliderFloat("Max distance (mm)", &p.depthDistMaxMm,
+				                              0.f, 10000.f, "%.0f");
+				// Keep min <= max so the clamp range is always valid.
+				if(p.depthDistMinMm > p.depthDistMaxMm){
+					p.depthDistMinMm = p.depthDistMaxMm;
+				}
+				ImGui::Unindent();
+			}
+
 			if(changed && cap->isStreaming()){
 				cap->applyDepthFilterParams(p);
 			}
@@ -348,16 +365,114 @@ void SplatEditor::makeOrbbecGUI(){
 			if(ImGui::Button("Read back")){
 				p = cap->getCameraParams();
 			}
+
+			ImGui::Separator();
+			// --- Save / Load camera params (device control + filters +
+			//     stream config) to a JSON file under calibration/. ---
+			if(ImGui::Button("Save Params")){
+				if(!editor->orbbecDevices.empty()){
+					int idx = std::clamp(editor->orbbecSelectedDevice, 0,
+					                     (int)editor->orbbecDevices.size() - 1);
+					const auto& d = editor->orbbecDevices[idx];
+					int refW = editor->orbbecCfgColor.width  > 0 ? editor->orbbecCfgColor.width  : 640;
+					int refH = editor->orbbecCfgColor.height > 0 ? editor->orbbecCfgColor.height : 480;
+					std::string id = d.serialNumber.empty() ? d.uid : d.serialNumber;
+					std::string path = orbbec::CalibrationStore::cameraParamsPathFor(id, refW, refH);
+					orbbec::CameraParamsFile cpf;
+					cpf.deviceSerial = id;
+					cpf.deviceName   = d.name;
+					cpf.params       = p;
+					cpf.colorCfg     = editor->orbbecCfgColor;
+					cpf.depthCfg     = editor->orbbecCfgDepth;
+					// ISO-8601 timestamp (simple, no external dep).
+					{
+						auto t = std::time(nullptr);
+						std::tm tm{};
+						#ifdef _WIN32
+						localtime_s(&tm, &t);
+						#else
+						localtime_r(&t, &tm);
+						#endif
+						char buf[32];
+						std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+						cpf.timestamp = buf;
+					}
+					if(orbbec::CalibrationStore::saveCameraParams(cpf, path)){
+						editor->orbbecParamsSaveMsg = format("saved: {}", path);
+					} else {
+						editor->orbbecParamsSaveMsg = "save failed";
+					}
+				} else {
+					editor->orbbecParamsSaveMsg = "no device selected";
+				}
+			}
+			ImGui::SameLine();
+			if(ImGui::Button("Load Params")){
+				if(!editor->orbbecDevices.empty()){
+					int idx = std::clamp(editor->orbbecSelectedDevice, 0,
+					                     (int)editor->orbbecDevices.size() - 1);
+					const auto& d = editor->orbbecDevices[idx];
+					int refW = editor->orbbecCfgColor.width  > 0 ? editor->orbbecCfgColor.width  : 640;
+					int refH = editor->orbbecCfgColor.height > 0 ? editor->orbbecCfgColor.height : 480;
+					std::string id = d.serialNumber.empty() ? d.uid : d.serialNumber;
+					orbbec::CameraParamsFile cpf;
+					if(orbbec::CalibrationStore::loadCameraParamsForDevice(cpf, id, refW, refH)){
+						editor->orbbecParams     = cpf.params;
+						editor->orbbecCfgColor   = cpf.colorCfg;
+						editor->orbbecCfgDepth   = cpf.depthCfg;
+						editor->orbbecParamsSaveMsg = format("loaded: {}", cpf.filePath);
+						// Push the loaded params to the device / filters live.
+						p = cpf.params;
+						cap->setStreamConfig(cpf.colorCfg, cpf.depthCfg);
+						if(cap->isOpen())  cap->applyCameraParams(p);
+						if(cap->isStreaming()) cap->applyDepthFilterParams(p);
+					} else {
+						editor->orbbecParamsSaveMsg = "no saved params file for this device";
+					}
+				} else {
+					editor->orbbecParamsSaveMsg = "no device selected";
+				}
+			}
+			if(!editor->orbbecParamsSaveMsg.empty()){
+				ImGui::SameLine();
+				ImGui::TextDisabled("%s", editor->orbbecParamsSaveMsg.c_str());
+			}
 		}
 
 		// ==================================================================
 		// Point cloud preview
 		// ==================================================================
 		if(ImGui::CollapsingHeader("Point Cloud")){
+			auto& p = editor->orbbecParams;
+			bool pcChanged = false;
+
 			bool pc = cap->isPointCloudEnabled();
-			if(ImGui::Checkbox("Generate RGB point cloud", &pc)){
+			if(ImGui::Checkbox("显示点云 (Generate RGB point cloud)", &pc)){
 				cap->setPointCloudEnabled(pc);
 			}
+
+			ImGui::Separator();
+
+			// Point cloud alignment direction: D2C (depth→color resolution)
+			// or C2D (color→depth resolution). C2D keeps the cloud in the
+			// depth sensor's coordinate system.
+			const char* pcAlignModes[] = { "D2C (depth->color)", "C2D (color->depth)" };
+			int pcAlignIdx = (p.pointCloudAlignMode == AlignMode(3)) ? 1 : 0;
+			if(ImGui::Combo("Point cloud alignment", &pcAlignIdx, pcAlignModes, IM_ARRAYSIZE(pcAlignModes))){
+				p.pointCloudAlignMode = (pcAlignIdx == 1) ? AlignMode(3) : AlignMode(2);
+				pcChanged = true;
+			}
+
+			// Route the denoised depth frame back into the point-cloud path
+			// so the cloud reflects the active depth denoising filters.
+			pcChanged |= ImGui::Checkbox("Use denoised depth for point cloud",
+			                             &p.pointCloudUseDenoisedDepth);
+
+			if(pcChanged && cap->isStreaming()){
+				cap->applyDepthFilterParams(p);
+			}
+
+			ImGui::Separator();
 
 			// The button toggles the preview node's presence; its label
 			// reflects whether the node currently exists (not the generation

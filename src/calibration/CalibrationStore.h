@@ -41,6 +41,26 @@ public:
     // The base directory under which calibration files are stored.
     // Defaults to "<cwd>/calibration" but is resolved once on first use.
     static std::string baseDir();
+
+    // --- Camera parameters (device control + filters + stream config) ---
+
+    // Save camera params to an explicit path.
+    static bool saveCameraParams(const CameraParamsFile& cpf, const std::string& path);
+
+    // Load camera params from an explicit path.
+    static bool loadCameraParams(CameraParamsFile& cpf, const std::string& path);
+
+    // Locate and load the default params file for a device, if one exists.
+    // Returns false (without error) if no matching file is present.
+    static bool loadCameraParamsForDevice(CameraParamsFile& cpf,
+                                          const std::string& serial,
+                                          int refW, int refH);
+
+    // Compose the default camera-params file path for a device.
+    // Filename: "<serial>_params_<w>x<h>.json" (kept distinct from the lens
+    // calibration file "<serial>_<w>x<h>.json").
+    static std::string cameraParamsPathFor(const std::string& serial,
+                                           int refW, int refH);
 };
 
 } // namespace orbbec

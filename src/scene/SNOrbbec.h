@@ -54,6 +54,15 @@ struct SNOrbbec : public SNPoints {
 	glm::vec3 pcTarget = glm::vec3(0.0f);
 	bool pcCameraInited = false;          // set once the first AABB frame is framed
 
+	// Drag state machine for the panel. Tracking down/up rather than relying
+	// on ImGui::IsMouseDragging() avoids the "stuck dragging" bug where the
+	// cursor leaves the panel while a button is held and the cloud keeps
+	// spinning until the user clicks inside again.
+	bool pcRotating = false;              // left button is held (rotate)
+	bool pcPanning  = false;              // right/middle button held (pan)
+	float pcLastMouseX = 0.0f;            // last cursor pos for delta calc
+	float pcLastMouseY = 0.0f;
+
 	SNOrbbec(string name) : SNPoints(name) {
 		this->points = make_shared<Points>();
 		this->points->name = name;

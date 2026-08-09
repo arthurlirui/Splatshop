@@ -1898,6 +1898,7 @@ void SplatEditor::drawGUI() {
 		makeOrbbecPreviewGUI();
 		makeOrbbecPointCloudGUI();
 		makeOrbbecCalibrationGUI();
+		makeOrbbecPnPGUI();
 		makeK4aGUI();
 		makeK4aPreviewGUI();
 		makeK4aRecordGUI();
@@ -2521,6 +2522,7 @@ int32_t SplatEditor::getNumDeletedSplats(){
 #include "gui/orbbec.h"
 #include "gui/orbbec_preview.h"
 #include "gui/orbbec_calibration.h"
+#include "gui/orbbec_pnp.h"
 #include "gui/k4a.h"
 #include "gui/k4a_preview.h"
 #include "gui/k4a_record.h"

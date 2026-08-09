@@ -147,6 +147,12 @@ void SplatEditor::makeMenubar(){
 			editor->settings.showOrbbecCalibration = !editor->settings.showOrbbecCalibration;
 		}
 		endHighlightButtonIf();
+
+		startHighlightButtonIf(editor->settings.showOrbbecPnP);
+		if(ImGui::Button("PnP")){
+			editor->settings.showOrbbecPnP = !editor->settings.showOrbbecPnP;
+		}
+		endHighlightButtonIf();
 #endif
 
 #ifdef SPLATSHOP_HAS_K4A

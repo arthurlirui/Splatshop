@@ -100,4 +100,54 @@ bool CalibrationStore::loadForDevice(DeviceCalibration& cal, const std::string& 
     return load(cal, path);
 }
 
+// ---------------------------------------------------------------------------
+// Camera parameters (device control + depth filters + stream config).
+// Reuses the private writeJson/readJson helpers above; same JSON format and
+// calibration/ directory as the lens-calibration files.
+// ---------------------------------------------------------------------------
+
+std::string CalibrationStore::cameraParamsPathFor(const std::string& serial,
+                                                  int refW, int refH) {
+    std::string sn = serial.empty() ? "unknown" : serial;
+    for (char& c : sn) {
+        if (c == '/' || c == '\\' || c == ':' || c == ' ' || c == '?')
+            c = '_';
+    }
+    std::string name = format("{}_params_{}x{}.json", sn, refW, refH);
+    return (std::filesystem::path(baseDir()) / name).string();
+}
+
+bool CalibrationStore::saveCameraParams(const CameraParamsFile& cpf,
+                                        const std::string& path) {
+    nlohmann::json j = cpf;
+    if (!writeJson(j, path)) return false;
+    println("CalibrationStore: saved camera params '{}' for device '{}'",
+            path, cpf.deviceSerial);
+    return true;
+}
+
+bool CalibrationStore::loadCameraParams(CameraParamsFile& cpf,
+                                        const std::string& path) {
+    nlohmann::json j;
+    if (!readJson(j, path)) return false;
+    try {
+        cpf = j.get<CameraParamsFile>();
+        cpf.filePath = path;
+    } catch (const std::exception& e) {
+        println("CalibrationStore: camera-params schema mismatch for '{}': {}",
+                path, e.what());
+        return false;
+    }
+    println("CalibrationStore: loaded camera params '{}'", path);
+    return true;
+}
+
+bool CalibrationStore::loadCameraParamsForDevice(CameraParamsFile& cpf,
+                                                 const std::string& serial,
+                                                 int refW, int refH) {
+    std::string path = cameraParamsPathFor(serial, refW, refH);
+    if (!std::filesystem::exists(path)) return false;
+    return loadCameraParams(cpf, path);
+}
+
 } // namespace orbbec

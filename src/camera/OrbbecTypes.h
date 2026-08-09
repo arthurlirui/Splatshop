@@ -142,6 +142,28 @@ struct CameraParams {
     bool  temporalFilterEnabled = false;  // TemporalFilter: temporal jitter reduction
     float temporalWeight        = -1.f;   // blending weight (0-1, default 0.4)
     float temporalDiffScale     = -1.f;   // diff scale (default 0.1)
+
+    // --- Point cloud generation options ---
+    // These are read by captureLoop() on every frame (no stream restart
+    // required). `pointCloudUseDenoisedDepth` routes the post-filter depth
+    // frame back into the SDK PointCloudFilter so the cloud reflects the
+    // denoised depth map; `pointCloudAlignMode` selects the alignment
+    // direction used for the cloud (C2D = color aligned onto the depth
+    // frame's resolution, D2C = depth onto the color frame's resolution).
+    bool      pointCloudUseDenoisedDepth = true;
+    AlignMode pointCloudAlignMode        = AlignMode(3); // ALIGN_C2D_SW_MODE
+
+    // --- Depth distance filter (host-side pixel clamp) ---
+    // Applied in captureLoop() AFTER the SDK denoising filters, before the
+    // snapshot is built. Pixels whose distance (pixel * depthScale, in mm)
+    // falls outside [depthDistMinMm, depthDistMaxMm] are zeroed (treated as
+    // invalid). This is a software filter independent of the device-level
+    // minDepth/maxDepth properties (OB_PROP_MIN/MAX_DEPTH_INT), so it also
+    // affects the denoised depth map and the generated point cloud. Toggled
+    // live via applyDepthFilterParams() (no stream restart required).
+    bool  depthDistFilterEnabled = false;
+    float depthDistMinMm         = 300.0f;   // min keep distance (mm), 0.3 m
+    float depthDistMaxMm         = 5000.0f;  // max keep distance (mm), 5.0 m
 };
 
 // ---------------------------------------------------------------------------
