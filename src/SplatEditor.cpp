@@ -1898,6 +1898,10 @@ void SplatEditor::drawGUI() {
 		makeOrbbecPreviewGUI();
 		makeOrbbecPointCloudGUI();
 		makeOrbbecCalibrationGUI();
+		makeK4aGUI();
+		makeK4aPreviewGUI();
+		makeK4aRecordGUI();
+		makeK4aTransformGUI();
 
 		// { // PROTOTYPING / DEBUG: Toggle between 3DGS and perspective correct scenes and rendering
 
@@ -2517,3 +2521,7 @@ int32_t SplatEditor::getNumDeletedSplats(){
 #include "gui/orbbec.h"
 #include "gui/orbbec_preview.h"
 #include "gui/orbbec_calibration.h"
+#include "gui/k4a.h"
+#include "gui/k4a_preview.h"
+#include "gui/k4a_record.h"
+#include "gui/k4a_transform.h"

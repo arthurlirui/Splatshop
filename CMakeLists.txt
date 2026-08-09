@@ -10,6 +10,7 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 include(cmake/common.cmake)
 include(cmake/libtorch.cmake)   # adds ADD_LIBTORCH(target) function
 include(cmake/orbbec.cmake)     # adds ADD_ORBBEC(target) function
+include(cmake/k4a.cmake)        # adds ADD_K4A(target) function (K4A Wrapper, parallel to OrbbecSDK)
 include(cmake/opencv.cmake)     # adds ADD_OPENCV(target) function (calibration module)
 
 ##############################################
@@ -67,6 +68,7 @@ target_include_directories(${TARGET_NAME} PRIVATE
 	ADD_CUDA(${TARGET_NAME})
 	ADD_LIBTORCH(${TARGET_NAME})   # 4DGS support (optional; silently skips if not found)
 	ADD_ORBBEC(${TARGET_NAME})     # Orbbec RGBD camera support (optional; silently skips if not found)
+	ADD_K4A(${TARGET_NAME})        # K4A Wrapper RGBD camera support (optional; silently skips if not found; must follow ADD_ORBBEC)
 	ADD_OPENCV(${TARGET_NAME})     # OpenCV calibration support (optional; silently skips if not found)
 	ADD_OPENGL(${TARGET_NAME})
 ADD_GLM(${TARGET_NAME})

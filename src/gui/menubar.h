@@ -149,6 +149,32 @@ void SplatEditor::makeMenubar(){
 		endHighlightButtonIf();
 #endif
 
+#ifdef SPLATSHOP_HAS_K4A
+		startHighlightButtonIf(editor->settings.showK4a);
+		if(ImGui::Button("K4A")){
+			editor->settings.showK4a = !editor->settings.showK4a;
+		}
+		endHighlightButtonIf();
+
+		startHighlightButtonIf(editor->settings.showK4aPreview);
+		if(ImGui::Button("K4A Preview")){
+			editor->settings.showK4aPreview = !editor->settings.showK4aPreview;
+		}
+		endHighlightButtonIf();
+
+		startHighlightButtonIf(editor->settings.showK4aRecord);
+		if(ImGui::Button("K4A Record")){
+			editor->settings.showK4aRecord = !editor->settings.showK4aRecord;
+		}
+		endHighlightButtonIf();
+
+		startHighlightButtonIf(editor->settings.showK4aTransform);
+		if(ImGui::Button("K4A Transform")){
+			editor->settings.showK4aTransform = !editor->settings.showK4aTransform;
+		}
+		endHighlightButtonIf();
+#endif
+
 		startHighlightButtonIf(editor->settings.showColorCorrection);
 		if(ImGui::Button("Color Correction")){
 			editor->settings.showColorCorrection = !editor->settings.showColorCorrection;

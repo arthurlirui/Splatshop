@@ -255,9 +255,18 @@ bool OrbbecCapture::start() {
             // when the user has not specified one, let the SDK pick.
             int irFmt = impl->cfgIR.format;
             if (irFmt < 0) irFmt = (int)OB_FORMAT_Y8;
-            config->enableVideoStream(OB_STREAM_IR,
-                impl->cfgIR.width, impl->cfgIR.height,
-                impl->cfgIR.fps, intToFormat(irFmt));
+            // Only add the IR stream to the config when a concrete
+            // resolution has been configured. Femto Mega has no profile
+            // matching {IR, Y8, 0, 0, 0} (width/height/fps = ANY), and
+            // requesting it makes pipeline->start() fail with
+            // "No matched profile found". When calibration needs IR, the
+            // caller should pass a valid profile (e.g. queried via
+            // getSupportedProfiles(OB_SENSOR_IR)) through setIrStreamConfig().
+            if (impl->cfgIR.width > 0 && impl->cfgIR.height > 0) {
+                config->enableVideoStream(OB_STREAM_IR,
+                    impl->cfgIR.width, impl->cfgIR.height,
+                    impl->cfgIR.fps, intToFormat(irFmt));
+            }
         }
         if (!impl->cfgColor.enable && !impl->cfgDepth.enable) {
             // Nothing requested - fall back to defaults so the user sees
@@ -307,7 +316,16 @@ bool OrbbecCapture::start() {
             int diffVal = impl->params.hwNoiseMinDiff >= 0 ? impl->params.hwNoiseMinDiff : 5;
             for (int i = 0; i < 16; ++i) lp.max_lut[i] = (uint16_t)lutVal;
             lp.min_diff = (uint16_t)diffVal;
-            lp.width  = 0; lp.height = 0;
+            // The LUT filter requires width/height in [1, 1280]; 0 triggers
+            // an INVALID_VALUE exception ("config item width value 0 out of
+            // range [1, 1280]"). At start() time the live stream resolution
+            // is not yet known, so seed it from the configured depth
+            // resolution (or a safe 640x480 fallback). captureLoop() will
+            // refresh it from the first depth frame's actual dimensions.
+            int lutW = impl->cfgDepth.width  > 0 ? impl->cfgDepth.width  : 640;
+            int lutH = impl->cfgDepth.height > 0 ? impl->cfgDepth.height : 480;
+            lp.width  = (uint16_t)std::clamp(lutW, 1, 1280);
+            lp.height = (uint16_t)std::clamp(lutH, 1, 1280);
             try { impl->hwNoiseRemoval->setFilterParams(lp); } catch (...) {}
             impl->hwNoiseRemoval->enable(impl->params.hwNoiseRemovalEnabled);
         }
@@ -912,7 +930,12 @@ void OrbbecCapture::applyDepthFilterParams(const CameraParams& p) {
         int diffVal = p.hwNoiseMinDiff >= 0 ? p.hwNoiseMinDiff : 5;
         for (int i = 0; i < 16; ++i) lp.max_lut[i] = (uint16_t)lutVal;
         lp.min_diff = (uint16_t)diffVal;
-        lp.width  = 0; lp.height = 0;
+        // width/height must be in [1, 1280]; see the note in start(). Use
+        // the configured depth resolution or a safe 640x480 fallback.
+        int lutW = impl->cfgDepth.width  > 0 ? impl->cfgDepth.width  : 640;
+        int lutH = impl->cfgDepth.height > 0 ? impl->cfgDepth.height : 480;
+        lp.width  = (uint16_t)std::clamp(lutW, 1, 1280);
+        lp.height = (uint16_t)std::clamp(lutH, 1, 1280);
         try { impl->hwNoiseRemoval->setFilterParams(lp); } catch (...) {}
     }
     if (impl->noiseRemoval && p.denoiseFilterEnabled) {

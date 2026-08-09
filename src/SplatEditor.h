@@ -22,8 +22,12 @@
 #include "./scene/SNPointCloudBA.h"
 #include "./scene/SNTriangles.h"
 #include "./scene/SNOrbbec.h"
+#include "./scene/SNK4a.h"
 #ifdef SPLATSHOP_HAS_ORBBEC
 #include "./camera/OrbbecCapture.h"
+#endif
+#ifdef SPLATSHOP_HAS_K4A
+#include "./camera/K4aCapture.h"
 #endif
 #ifdef SPLATSHOP_HAS_OPENCV
 #include "Calibration.h"
@@ -192,6 +196,52 @@ struct SplatEditor{
 	std::string orbbecCalibSavePath;
 	std::string orbbecCalibLoadPath;
 #endif
+#endif
+
+#ifdef SPLATSHOP_HAS_K4A
+	// K4A Wrapper RGBD camera module. k4aCapture owns the K4A device and
+	// polling thread; snK4a is the live point-cloud scene node fed from it.
+	// Both are created lazily from the K4A GUI panel.
+	shared_ptr<k4a::K4aCapture> k4aCapture = nullptr;
+	shared_ptr<SNK4a> snK4a = nullptr;
+	vector<k4a::K4aDeviceInfo> k4aDevices;
+	int k4aSelectedDevice = 0;
+	k4a::K4aStreamConfig k4aStreamCfg;
+
+	// --- K4A real-time preview (Color + Depth + IR textures in ImGui) ---
+	GLuint k4aTexColor = 0;
+	GLuint k4aTexDepth = 0;
+	GLuint k4aTexIr = 0;
+	int k4aTexColorW = 0, k4aTexColorH = 0, k4aTexColorBpp = 0;
+	int k4aTexDepthW = 0, k4aTexDepthH = 0, k4aTexDepthBpp = 0;
+	int k4aTexIrW = 0, k4aTexIrH = 0, k4aTexIrBpp = 0;
+	vector<uint8_t> k4aColorScratch;
+	vector<uint8_t> k4aDepthScratch;
+	vector<uint8_t> k4aIrScratch;
+	vector<uint8_t> k4aDepthLUT;
+	int k4aDepthLUTType = -1;
+	shared_ptr<k4a::K4aFrame> k4aPreviewHeldFrame = nullptr;
+
+	// --- K4A calibration display text ---
+	std::string k4aCalibText;
+
+	// --- K4A recording / playback state ---
+	k4a::K4aRecordConfig k4aRecordCfg;
+	std::string k4aRecordPath;
+	std::string k4aPlaybackPath;
+	bool k4aPlaybackPlaying = false;
+	int64_t k4aPlaybackPos = 0;
+	shared_ptr<k4a::K4aFrame> k4aPlaybackFrame = nullptr;
+
+	// --- K4A transformation / point cloud state ---
+	shared_ptr<Buffer> k4aTransformBuf = nullptr;   // transformed image buffer
+	int k4aTransformW = 0, k4aTransformH = 0;
+	int k4aTransformMode = 0;  // 0=depth-to-color, 1=color-to-depth
+	shared_ptr<Buffer> k4aPointCloudBuf = nullptr;  // point cloud buffer
+	int k4aPointCloudW = 0, k4aPointCloudH = 0;
+	int64_t k4aPointCloudCount = 0;
+	bool k4aPointCloudColorized = false;
+	std::string k4aPlyPath;
 #endif
 
 	vector<SceneNode*> scheduledForRemoval;
@@ -401,6 +451,17 @@ struct SplatEditor{
 	int  orbbecUndistortMode = 0;
 	bool orbbecUseCalibratedIntrinsics = false; // use calibrated intrinsics for point cloud
 #endif
+#ifdef SPLATSHOP_HAS_K4A
+	bool showK4a = false;                  // K4A Wrapper camera control panel
+	bool showK4aPreview = false;           // K4A live preview panel (color/depth/IR)
+	bool showK4aRecord = false;            // K4A recording / playback panel
+	bool showK4aTransform = false;         // K4A coordinate transformation / point cloud panel
+	bool k4aPreviewPaused = false;         // freeze the preview on the current frame
+	bool k4aPreviewAutofit = true;         // auto-fit images to window
+	int  k4aDepthColormap = 0;             // 0=Turbo 1=Jet 2=Gray 3=Inferno
+	float k4aDepthMaxMeters = 4.0f;        // max distance for depth normalization
+	bool k4aShowIr = false;                // show IR stream in preview
+#endif
 	bool openContextMenu = false;
 
 		bool showInset = false;
@@ -562,6 +623,12 @@ struct SplatEditor{
 	void makeOrbbecPreviewGUI();
 	void makeOrbbecPointCloudGUI();
 	void makeOrbbecCalibrationGUI();
+
+	// K4A Wrapper panel methods (stubs when SPLATSHOP_HAS_K4A is undefined).
+	void makeK4aGUI();
+	void makeK4aPreviewGUI();
+	void makeK4aRecordGUI();
+	void makeK4aTransformGUI();
 
 	// Point-cloud density optimization. Voxel-grid downsampling: collapses every
 	// occupied voxel of edge length voxelSize to its centroid, producing a new
