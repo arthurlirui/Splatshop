@@ -16,6 +16,9 @@
 #include "remote/RemoteControlServer.h"
 #include "remote/FrameStreamer.h"
 
+#include <cstdio>
+#include <iostream>
+
 using namespace std;
 
 SplatEditor* editor = nullptr;
@@ -243,6 +246,13 @@ void initScene() {
 }
 
 int main(){
+
+	// 禁用 stdout/stderr 缓冲，确保任何早期崩溃/exit 的输出都能即时可见
+	setvbuf(stdout, nullptr, _IONBF, 0);
+	setvbuf(stderr, nullptr, _IONBF, 0);
+	std::cout.setf(std::ios::unitbuf);
+
+	try {
 
 	initCuda();
 
@@ -474,4 +484,17 @@ int main(){
 	);
 
 	return 0;
+
+	} // end try
+
+	catch (const std::exception& e) {
+		fprintf(stderr, "FATAL: uncaught exception: %s\n", e.what());
+		fflush(stderr);
+		return 1;
+	}
+	catch (...) {
+		fprintf(stderr, "FATAL: unknown exception\n");
+		fflush(stderr);
+		return 1;
+	}
 }
