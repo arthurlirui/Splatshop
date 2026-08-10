@@ -43,7 +43,49 @@ A precompiled windows binary is available [here](http://users.cg.tuwien.ac.at/ms
 	<li> App freezing: Line rendering caused freezes on RTX 20xx series cards. That was fixed, but there is a chance that triangle models in VR mode may also freeze RTX 20xx series cards. 
 </ul>
 
-## Installing
+## Troubleshooting
+
+### 启动闪退且无任何错误输出（`0xC0000139`）
+
+**症状**：命令行运行 `SplatEditor.exe` 立即退出，无窗口、无错误信息，PowerShell 报退出码 `-1073741511`（即 `0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND`）。
+
+**根因**：`build/Release/` 目录下混入了**旧版本的 `OrbbecSDK.dll`**，其导出表缺少新版头文件中声明的入口函数（如 `ob_device_list_get_device_ex` 等）。Windows 加载器在进程进入 `main` 之前就因找不到入口点而终止进程，因此程序自身的任何诊断/打印代码都来不及执行，表现为完全静默的闪退。
+
+具体到本项目：CMake 的 `cmake/k4a.cmake` 原先也通过 POST BUILD 把 `OrbbecSDK_K4A_Wrapper/bin/OrbbecSDK.dll`（旧版 2.5.5）拷贝到输出目录，与 `cmake/orbbec.cmake` 拷贝的主 OrbbecSDK（2.9.3）冲突，后者被旧版覆盖。**已修复**：`k4a.cmake` 不再拷贝 `OrbbecSDK.dll` / `OrbbecSDKConfig.xml` / `extensions`，统一由 `orbbec.cmake` 负责。
+
+**排查方法**：
+1. 用 `dumpbin /dependents SplatEditor.exe` 列出直接依赖的 DLL。
+2. 用 `dumpbin /exports <dll>` 比对每个 DLL 的导出表是否包含 exe 期望的入口函数（C++ 修饰名也要对照）。
+3. 确认 `build/Release/OrbbecSDK.dll` 的版本与 `libs/OrbbecSDK/bin/OrbbecSDK.dll` 一致（应为 2.9.3）：
+   ```powershell
+   (Get-Item 'build\Release\OrbbecSDK.dll').VersionInfo.ProductVersion
+   ```
+
+**修复**：删除 `build/Release/` 下的旧版 `OrbbecSDK.dll`，重新编译（POST BUILD 会从 `libs/OrbbecSDK/bin` 拷贝正确的 2.9.3 版本）。
+
+### CUDA / LibTorch 版本不匹配
+
+exe 用系统 CUDA Toolkit（如 13.2）的 `nvcc` 编译，运行时同时加载 LibTorch 自带的 CUDA 12.x 运行时 DLL。两套 CUDA 主版本混用可能再次引发 `0xC0000139`（如 `nvrtc64_130_0.dll` 与 `nvrtc64_120_0.dll` 同时存在）。
+
+**预防**：LibTorch 的 CUDA 版本应与系统 CUDA Toolkit 主版本一致，或保持向后兼容（见 [4DGS Dynamic Scenes](#4dgs-dynamic-scenes) 的兼容性表）。若不使用 4DGS 功能，可临时重命名 `libs/libtorch` 目录以屏蔽 LibTorch，CMake 会自动跳过（4DGS 退化为 no-op stub）。
+
+### OpenGL 4.6 窗口创建失败
+
+**症状**：程序启动后 `exit(EXIT_FAILURE)` 退出，可能只看到 `<create windows>` 后即结束。
+
+**根因**：`GLRenderer` 默认请求 OpenGL 4.6 Core Profile，旧驱动 / 无独显 / 远程会话无 GL 上下文时会失败。**已改进**：失败时打印真实 GLFW 错误描述，并自动降级尝试 4.5/4.4/4.3/4.2/4.1/4.0/3.3；`main` 已加 `try/catch` 捕获未处理异常并输出到 stderr。
+
+### 必须从项目根目录运行
+
+程序在运行时用相对路径 `./src/gaussians_rendering.cu` 做 CUDA JIT 编译，并读取 `./resources/...`、`./splatmodels/scene.json` 等资源。**必须从仓库根目录启动**：
+
+```bash
+cd /path/to/Splatshop
+./build/Release/SplatEditor.exe
+```
+
+若从 `build/Release/` 目录直接运行，会报 `ERROR: file not found: './src/gaussians_rendering.cu'` 后因异常退出。
+
 
 <details>
 <summary>Windows</summary>

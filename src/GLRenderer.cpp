@@ -9,6 +9,15 @@ namespace fs = std::filesystem;
 
 using std::print;
 
+// 记录最近一次 GLFW 错误描述，供窗口创建失败时读取真实原因
+// （GLFW 的 error_callback 是异步回调，无法直接在 glfwCreateWindow 返回后拿到）
+static thread_local std::string g_lastGlfwError;
+
+static const char* glfwErrorDescription() {
+	return g_lastGlfwError.empty() ? "(no error recorded)" : g_lastGlfwError.c_str();
+}
+
+
 
 static void APIENTRY debugCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, const void* userParam) {
 
@@ -27,7 +36,9 @@ static void APIENTRY debugCallback(GLenum source, GLenum type, GLuint id, GLenum
 }
 
 void error_callback(int error, const char* description){
-	fprintf(stderr, "Error: %s\n", description);
+	g_lastGlfwError = description ? description : "(null)";
+	fprintf(stderr, "GLFW Error %d: %s\n", error, g_lastGlfwError.c_str());
+	fflush(stderr);
 }
 
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods){
@@ -127,7 +138,9 @@ void GLRenderer::init(){
 	glfwSetErrorCallback(error_callback);
 
 	if (!glfwInit()) {
-		// Initialization failed
+		fprintf(stderr, "FATAL: glfwInit() failed. GLFW error: %s\n", glfwErrorDescription());
+		fflush(stderr);
+		exit(EXIT_FAILURE);
 	}
 
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
@@ -173,7 +186,38 @@ void GLRenderer::init(){
 		window = glfwCreateWindow(width, height, "Splat Editor", nullptr, nullptr);
 
 		if (!window) {
+			// OpenGL 4.6 不可用时，打印真实 GLFW 错误并自动降级尝试更低版本
+			fprintf(stderr, "FATAL: glfwCreateWindow failed (requested OpenGL 4.6). "
+			                 "GLFW error: %s\n", glfwErrorDescription());
+			fflush(stderr);
+
+			struct { int major; int minor; } fallbacks[] = {
+				{4, 5}, {4, 4}, {4, 3}, {4, 2}, {4, 1}, {4, 0}, {3, 3}
+			};
+			for (auto& fb : fallbacks) {
+				glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, fb.major);
+				glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, fb.minor);
+				g_lastGlfwError.clear();
+				window = glfwCreateWindow(width, height, "Splat Editor", nullptr, nullptr);
+				if (window) {
+					fprintf(stderr, "Fell back to OpenGL %d.%d\n", fb.major, fb.minor);
+					fflush(stderr);
+					break;
+				}
+				fprintf(stderr, "  fallback OpenGL %d.%d failed: %s\n",
+				        fb.major, fb.minor, glfwErrorDescription());
+				fflush(stderr);
+			}
+		}
+
+		if (!window) {
 			glfwTerminate();
+			// 仅打印 stderr（不弹窗，避免 windows.h 与 glew 头冲突）。
+			// main 的 try/catch 不会捕获 exit()，故此处直接 exit；
+			// stderr 已在 main 顶部禁用缓冲，输出即时可见。
+			fprintf(stderr, "FATAL: Failed to create OpenGL window (tried 4.6 down to 3.3). "
+			                 "Check your GPU driver supports OpenGL 4.x and is up to date.\n");
+			fflush(stderr);
 			exit(EXIT_FAILURE);
 		}
 
@@ -207,6 +251,7 @@ void GLRenderer::init(){
 	if (GLEW_OK != err) {
 		/* Problem: glewInit failed, something is seriously wrong. */
 		fprintf(stderr, "glew error: %s\n", glewGetErrorString(err));
+		fflush(stderr);
 	}
 
 	cout << "<glewInit done> " << "(" << now() << ")" << endl;

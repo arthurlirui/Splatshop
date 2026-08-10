@@ -9,8 +9,7 @@ set(GLFW_INSTALL OFF)
 
 FetchContent_Declare(
 		glfw
-		GIT_REPOSITORY      https://github.com/glfw/glfw.git
-		GIT_TAG             3.3.2
+		SOURCE_DIR ${CMAKE_SOURCE_DIR}/libs/glfw_src
 )
 
 # GLFW 3.3.2 declares cmake_minimum_required(VERSION 2.x), which CMake 4.0+

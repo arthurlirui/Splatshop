@@ -87,25 +87,17 @@ function(ADD_K4A TARGET_NAME)
         message(WARNING "OrbbecSDK::OrbbecSDK target not available (OrbbecSDK not found). k4arecord (recording/playback) disabled. Core K4A still enabled.")
     endif()
 
-    # Stage the runtime DLLs next to the executable. k4a.dll and
+    # Stage the runtime DLLs next to the executable. Only k4a.dll and
     # k4arecord.dll are the wrapper's own libraries; OrbbecSDK.dll and
-    # the extensions directory are shared with ADD_ORBBEC but
-    # copy_if_different makes the duplicate copy harmless.
+    # the extensions directory are owned by ADD_ORBBEC and copied there
+    # to avoid a stale/older OrbbecSDK.dll from this wrapper overwriting
+    # the canonical one staged by orbbec.cmake.
     if(WIN32)
         set(_K4A_BIN_DIR "${_K4A_SDK_DIR}/bin")
         add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${_K4A_BIN_DIR}/k4a.dll"
                 "$<TARGET_FILE_DIR:${TARGET_NAME}>"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${_K4A_BIN_DIR}/OrbbecSDK.dll"
-                "$<TARGET_FILE_DIR:${TARGET_NAME}>"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${_K4A_BIN_DIR}/OrbbecSDKConfig.xml"
-                "$<TARGET_FILE_DIR:${TARGET_NAME}>"
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                "${_K4A_BIN_DIR}/extensions"
-                "$<TARGET_FILE_DIR:${TARGET_NAME}>/extensions"
             COMMENT "POST BUILD: copying K4A Wrapper runtime files")
         if(_K4A_RECORD_ENABLED)
             add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
