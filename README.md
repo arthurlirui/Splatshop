@@ -69,6 +69,33 @@ exe 用系统 CUDA Toolkit（如 13.2）的 `nvcc` 编译，运行时同时加�
 
 **预防**：LibTorch 的 CUDA 版本应与系统 CUDA Toolkit 主版本一致，或保持向后兼容（见 [4DGS Dynamic Scenes](#4dgs-dynamic-scenes) 的兼容性表）。若不使用 4DGS 功能，可临时重命名 `libs/libtorch` 目录以屏蔽 LibTorch，CMake 会自动跳过（4DGS 退化为 no-op stub）。
 
+### 运行时 `CUDA_PATH` 必须与编译时 CUDA 版本一致
+
+Splatshop 在**运行时**通过 NVRTC 对 `./src/*.cu` 做 JIT 编译，include 路径取自环境变量 `CUDA_PATH`（见 `include/CudaModularProgram.h`）。因此 `CUDA_PATH` 必须指向**与编译时相同的 CUDA Toolkit**，否则会出现头文件与 NVRTC 运行时版本不匹配的编译错误。
+
+**典型错误**：用 CUDA 13.2 编译 exe，但运行时 `CUDA_PATH` 指向 12.4，JIT 编译报：
+```
+cooperative_groups/details/helpers.h(470): error: identifier "cudaCGScopeMultiGrid" is undefined
+```
+原因：12.4 的 `helpers.h` 使用了 `cudaCGScopeMultiGrid`（定义在 12.4 的 `driver_types.h`），但 13.2 的 NVRTC 运行时已移除该符号；反之亦然。两个版本的 cooperative_groups API 不互通。
+
+**修复**：确保运行 exe 的终端里 `CUDA_PATH` 指向编译时用的 CUDA（如 13.2）：
+```bash
+# Git Bash / Linux
+export CUDA_PATH="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"  # Windows
+# export CUDA_PATH=/usr/local/cuda-13.2                                      # Linux
+
+cd /path/to/Splatshop
+./build/Release/SplatEditor.exe
+```
+
+```powershell
+# Windows PowerShell（永久设置，需新开终端生效）
+[Environment]::SetEnvironmentVariable("CUDA_PATH", "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2", "User")
+```
+
+> 安装新的 CUDA Toolkit 时，NVIDIA 安装包可能把 `CUDA_PATH` 覆盖为最新版本。若多版本共存，运行 Splatshop 前请显式确认 `CUDA_PATH` 与编译版本一致。
+
 ### OpenGL 4.6 窗口创建失败
 
 **症状**：程序启动后 `exit(EXIT_FAILURE)` 退出，可能只看到 `<create windows>` 后即结束。
